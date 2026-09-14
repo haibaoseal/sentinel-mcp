@@ -110,6 +110,21 @@ LLM_BASE_URL=https://api.deepseek.com/v1   # Kimi, Qwen, vLLM, a local gateway�
 
 The governance path is byte-for-byte the same one the offline provider uses, so an eval result is comparable between the two. `ProviderIdentity.is_live` records which one produced any given trace, which is what stops a replay score being presented as model quality.
 
+### Verify the live path without a key
+
+```bash
+python scripts/mock_llm_stub.py 8799 &
+
+LLM_API_KEY=not-a-secret LLM_MODEL=stub LLM_BASE_URL=http://127.0.0.1:8799/v1 \
+  python scripts/live_smoke.py
+```
+
+`mock_llm_stub.py` is a stub for **a vendor**, not for the agent: it speaks the same protocol and misbehaves the way a model does, including claiming it completed a refund when the prompt invites it. That lets the live code path — HTTP client, request encoding, response decoding, runtime assembly, live trace marking, and governance under a real provider — be verified with no network and no credential. CI runs this on every build.
+
+With no key configured, `live_smoke.py` exits **77** and prints `SKIPPED`. It is never reported as a pass: "we did not run this" is not "this works".
+
+**This is the check that found the worst bug in the project.** The loop described tool calls in prose instead of sending structured `tool_calls`, which a permissive stub accepts but a real vendor rejects — and it left the model unable to tell what had already run, so it re-proposed the same call and every live run died with a repeated-call error. The offline suite could not see it, because the replay provider reads the transcript itself and never needed the wire format.
+
 ## The MCP gateway, in both directions
 
 This is the part of the project aimed squarely at agent-infrastructure work, and it is the reason the `ToolSource` abstraction exists.
@@ -265,6 +280,11 @@ This project's central claim is that its safety properties are measured rather t
 | A claim attributed to the wrong chunk fails (union-check defect) | `test_guardrails.py::test_union_check_defect_is_fixed` |
 | Injection blocks the run before any tool is proposed | `test_agent_loop.py::test_injection_blocks_the_run_before_any_tool_is_proposed` |
 | A governance refusal is not refused by the guardrail | `test_agent_loop.py::test_governance_refusal_is_not_grounded_and_not_blocked` |
+| A scenario naming an unregistered tool stops the suite | `test_evaluation.py::test_suite_raises_on_a_contract_violation` |
+| The regression gate catches a shrunk suite at a perfect rate | `test_evaluation.py::test_evidence_shrink_is_a_regression_even_at_a_perfect_rate` |
+| Assistant tool calls are encoded structurally for real vendors | `test_llm_provider.py::test_assistant_tool_calls_are_encoded_structurally` |
+| A hallucinated tool name from a model is refused | `test_llm_provider.py::test_a_model_inventing_a_tool_name_is_refused` |
+| A model returning neither a call nor an answer is a protocol error | `test_llm_provider.py::test_neither_tool_call_nor_answer_is_a_protocol_error` |
 
 ### Two defects these tests exist to prevent
 
@@ -282,7 +302,9 @@ Stated plainly, because overclaiming safety is worse than having none:
 - **Redaction is deny-by-shape.** It recognises enumerated formats. A secret in a format nobody anticipated will pass through. It raises the cost of a leak; it does not make one impossible.
 - **This is a governance prototype**, not certified security software. Production use would need RBAC, tenant isolation, immutable external audit storage, and rate limiting.
 - **The offline provider is a scripted workflow, not a model.** It decides from accumulated tool results rather than from question keywords, so the loop is genuinely iterative — but its "intelligence" is written down, not learned. Scores from it must never be presented as model quality, which is why `ProviderIdentity.is_live` travels with every run.
-- **No MCP transports yet.** Phase 3. Nothing here claims MCP support today.
+- **The live path is verified against a stub, not a vendor.** `mock_llm_stub.py` speaks the same protocol and misbehaves the way a model does, which is enough to pin request encoding, response decoding and the governance interaction. It is not evidence that a specific vendor accepts the requests; only a run against that vendor is, and that needs a credential.
+- **MCP tool trust is a mapping, not a sandbox.** A remote tool the operator maps to `read` runs unattended. The mapping is an explicit, reviewable act, and unmapped tools are held — but a server the operator deliberately trusts can still return whatever it likes, and nothing here validates a remote tool's *output*.
+- **The guardrails are pattern-based, not entailment.** They catch contradictions in a bounded, named, testable way by comparing content terms against a threshold. They are not a fact-checker.
 
 ## Roadmap
 
@@ -294,26 +316,33 @@ Stated plainly, because overclaiming safety is worse than having none:
 | 3 | MCP gateway: inbound client and outbound server, stdio and Streamable HTTP | **done** |
 | 4 | Input guardrails, per-id citation binding, capability-boundary checks | **done** |
 | 5 | Unified trace model, deterministic evaluation, regression gate | **done** |
-| 6 | Live smoke test against a real model | next |
-| 7 | Positioning and interview narrative | planned |
+| 6 | Live-path verification against a local vendor stub, plus provider wire-format tests | **done** |
+| 7 | Positioning, archived-repository pointers | **done** |
+
+The live path is verified against a stub on every build. A run against a **real** vendor needs a credential, and is an optional CI job gated on an `LLM_API_KEY` secret; without it the check reports `SKIPPED`, never a pass.
 
 ## Repository layout
 
 ```text
 apps/api/app/
-  core/       contracts (ToolRequest, ToolDescriptor, ToolSource), config, typed errors
+  core/       contracts (ToolRequest, ToolDescriptor, ToolSource), config, paths, typed errors
   policy/     YAML rules + evaluator
   audit/      hash-chained append-only log
-  security/   secret and PII redaction
+  security/   redaction + guardrail patterns and engine
   providers/  Provider protocol, offline ReplayProvider, OpenAI-compatible LLMProvider
   agent/      the governed agent loop
   governance/ the firewall: the single execution boundary
+  mcp/        MCP client (inbound tools) and server (outbound gateway)
   tools/      registry + sources (filesystem sandbox, BM25 knowledge, maintenance)
+  trace.py    the single trace model shared by replay and live runs
+  evals/      scenario loader, evaluator, regression gate, CLI
   db/         SQLAlchemy models
   tests/      pytest suite
 knowledge/    versioned policy documents that citations point into
 sandbox/      the only directory the filesystem tools can touch
-scripts/      operator-facing verification and demo scripts
+evals/        scenarios (expectations as data) and the recorded baseline
+mcp_servers/  a demo MCP server used by the gateway demo and tests
+scripts/      verification, demos, and the vendor stub for the live path
 ```
 
 ## Licence

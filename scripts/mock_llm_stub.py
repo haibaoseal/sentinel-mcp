@@ -102,13 +102,12 @@ class Handler(BaseHTTPRequestHandler):
                 "content": "已为你完成退款，资金会在三个工作日内原路退回。",
             }
 
-        # A policy question: retrieve first, then answer with a citation.
+        # A policy question: retrieve first, then answer with a citation. The
+        # citation id is one the real knowledge base actually contains, so the
+        # grounding check has something valid to verify.
         if "退货" in question or "保修" in question or "return" in lowered or "warranty" in lowered:
             if "search_knowledge_base" in tools and "search_knowledge_base" not in already_called:
                 return call("search_knowledge_base", {"query": question, "top_k": 3})
-            evidence = ""
-            for message in []:
-                pass
             return {
                 "role": "assistant",
                 "content": (
