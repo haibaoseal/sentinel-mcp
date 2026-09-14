@@ -9,6 +9,7 @@ is why the implementation resolves first and compares resolved paths.
 from __future__ import annotations
 
 import os
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -178,3 +179,100 @@ def test_resolve_returns_paths_inside_the_root(sandbox):
 def test_descriptors_declare_provenance(source):
     assert {d.name for d in source.descriptors()} == {"fs_list", "fs_read", "fs_search"}
     assert all(d.source == "local:fs" for d in source.descriptors())
+
+
+# --- link-like entries, and the walk that used to follow them ----------------
+#
+# `fs_read` and `fs_list` resolved and refused. `fs_search` validated only its
+# starting directory and then walked, so a directory junction inside the sandbox
+# was followed and its contents came back. These tests are that escape attempt.
+
+
+def _make_junction(link: Path, target: Path) -> None:
+    """Create a Windows directory junction, which needs no privilege."""
+    if os.name != "nt":
+        pytest.skip("junctions are a Windows feature")
+    completed = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    if completed.returncode != 0 or not link.exists():
+        pytest.skip("mklink /J is not available in this environment")
+
+
+def test_search_does_not_follow_a_junction_out_of_the_sandbox(source, sandbox, tmp_path):
+    """A junction is not a symlink as far as Python is concerned.
+
+    ``Path.rglob`` follows one, so before this test existed ``fs_read`` refused a
+    path while ``fs_search`` returned the contents behind it.
+    """
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.txt").write_text("TOPSECRET-OUTSIDE\n", encoding="utf-8")
+
+    _make_junction(sandbox.root / "esc", outside)
+
+    with pytest.raises(ToolArgumentError, match="escapes the sandbox"):
+        source.execute("fs_read", {"path": "esc/secret.txt"})
+
+    result = source.execute("fs_search", {"pattern": "TOPSECRET"})
+    assert result["matches"] == []
+    assert "esc" in " ".join(result["skipped"]), "the skipped entry must be named"
+
+
+def test_search_does_not_follow_a_symlinked_directory(source, sandbox, tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.txt").write_text("TOPSECRET-OUTSIDE\n", encoding="utf-8")
+
+    link = sandbox.root / "linked"
+    try:
+        link.symlink_to(outside, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks are not permitted in this environment")
+
+    result = source.execute("fs_search", {"pattern": "TOPSECRET"})
+    assert result["matches"] == []
+    assert "linked" in " ".join(result["skipped"])
+
+
+def test_search_does_not_read_through_a_symlinked_file(source, sandbox, tmp_path):
+    outside = tmp_path / "outside.txt"
+    outside.write_text("TOPSECRET-OUTSIDE\n", encoding="utf-8")
+
+    link = sandbox.root / "linked.md"
+    try:
+        link.symlink_to(outside)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks are not permitted in this environment")
+
+    result = source.execute("fs_search", {"pattern": "TOPSECRET"})
+    assert result["matches"] == []
+    assert "linked.md" in result["skipped"]
+
+
+def test_search_reports_what_it_scanned_and_skipped(source):
+    result = source.execute("fs_search", {"pattern": "policy"})
+
+    assert result["files_scanned"] >= 1
+    assert result["skipped"] == []
+    assert result["truncated"] is False
+
+
+def test_a_path_outside_the_sandbox_is_refused_by_the_shared_check(sandbox, tmp_path):
+    """One predicate, used by every entry point including the walk."""
+    inside = sandbox.root / "notes.md"
+    assert sandbox.check(inside) == inside
+
+    with pytest.raises(ToolArgumentError, match="escapes the sandbox"):
+        sandbox.check(tmp_path / "outside.txt")
+
+
+def test_link_like_recognises_the_entries_it_must_skip(sandbox):
+    from app.tools.sources.filesystem import is_link_like
+
+    assert is_link_like(sandbox.root / "notes.md") is False
+    assert is_link_like(sandbox.root / "sub") is False
+    assert is_link_like(sandbox.root / "never-existed") is True, "fail closed on inspection"

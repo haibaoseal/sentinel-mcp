@@ -85,7 +85,7 @@ python -m venv .venv
 # POSIX:   source .venv/bin/activate
 python -m pip install -e ".[dev]"
 
-python -m pytest apps/api/app/tests   # 405 collected; one symlink test skips on Windows
+python -m pytest apps/api/app/tests   # 411 collected; one symlink test skips on Windows
 python -m ruff check apps/api/app mcp_servers scripts
 python -m ruff format --check apps/api/app mcp_servers scripts
 ```
@@ -267,6 +267,8 @@ Raw token overlap with no IDF means high-frequency function characters decide th
 
 Path checks run on the *resolved* path with `strict=False`, so containment does not depend on the target existing. Checking the raw string would accept `../../etc/passwd`; checking after an existence test would report an escape attempt as "file not found", which is both a worse message and a weaker boundary.
 
+Every entry point calls that one predicate — including each file `fs_search` walks, which is the fix for a real escape. A directory junction is not a symlink as far as Python is concerned, so `rglob` followed one out of the sandbox while `fs_read` refused the same path. Link-like entries are now skipped and named in the result rather than silently dropped, and an unwalkable candidate is refused rather than opened.
+
 
 ## Evaluation: a gate, not a dashboard
 
@@ -316,7 +318,8 @@ This project's central claim is that its safety properties are measured rather t
 | A reviewer's edit cannot talk policy out of a `block` | `test_approvals.py::test_an_edit_cannot_talk_policy_out_of_a_block` |
 | An approval cannot be replayed, and is not transferable to another call | `test_approvals.py::test_an_approval_cannot_be_replayed` / `::test_an_approval_is_not_a_transferable_token` |
 | A `default_block` rule is not relaxed by an approval | `test_approvals.py::test_a_block_rule_is_not_relaxed_by_an_approval` |
-| Path traversal and absolute paths are refused by every filesystem tool; symlink escape is refused by `fs_read` and `fs_list` | `test_filesystem_sandbox.py` — note `fs_search` does **not** re-check each file it walks; see [Honest limitations](#honest-limitations) |
+| Path traversal and absolute paths are refused by every filesystem tool, and every file `fs_search` walks is re-checked | `test_filesystem_sandbox.py` |
+| A directory junction or symlink inside the sandbox is skipped and named, never followed | `test_filesystem_sandbox.py::test_search_does_not_follow_a_junction_out_of_the_sandbox` |
 | Citation line ranges point at the cited content | `test_knowledge_retrieval.py::test_line_range_points_at_the_real_content` |
 | An unrelated question returns no citations instead of weak matches | `test_knowledge_retrieval.py::test_unrelated_query_returns_nothing` |
 | An unmapped remote MCP tool is held for approval, not trusted | `test_mcp_gateway.py::test_unmapped_remote_tool_defaults_to_unknown_action` |
@@ -359,7 +362,7 @@ Stated plainly, because overclaiming safety is worse than having none:
 - **Approval expiry is not implemented.** The model lists an `expired` status; a pending request stays pending until someone decides. There is also no notification when a request is created.
 - **The audit chain cannot detect truncation of its own tail.** `verify_chain` requires `seq` to be gap-free from 1, so deleting the *most recent* events leaves a chain that still verifies — measured, not assumed (`test_unkeyed_chain_is_rewritable_from_genesis` covers the stronger attack of rewriting from genesis). Only an external anchor closes this: a published head, or a key held outside the database.
 - **Input screening covers the user request only.** `check_input` has exactly one caller, on `run.user_request`. Text returned by a tool, retrieved from the knowledge base, or supplied as a remote tool's `description` reaches the model unscreened. The function's docstring claimed it screened tool-supplied text; it does not, because nothing calls it there.
-- **`fs_search` does not re-check containment per file.** It validates the starting directory and then walks it, so a directory junction inside the sandbox (`mklink /J`, which needs no privilege on Windows) is followed and its contents are returned — while `fs_read` and `fs_list` refuse the same path. Measured.
+- **Resolving and then opening are two operations.** Containment is checked on the resolved path, so there is a window in which the named file could be swapped for a link pointing outside. Link-like entries are skipped rather than followed (symlinks, Windows junctions, any reparse point) and the final component is opened with `O_NOFOLLOW` where the platform has it, but intermediate directories are still resolved-then-opened everywhere. Closing that properly needs `openat`-style traversal, which Python does not expose portably.
 - **Redaction damages as well as protects.** `hex_secret` masks any 32–64 character hex run, so commit SHAs and digests are destroyed; the `auth` key marker matches `author`, so a GitHub author in an audit payload becomes `********`. Card numbers, SSNs, IBANs and `sk_live_`/`hf_`-style keys are not recognised at all.
 - **The capability check is a proximity heuristic and fails in both directions.** A negation word anywhere in the preceding 24 characters disarms it — including a stray 只 — so a fabricated completion can pass; and a negator sitting exactly at the match boundary can make an honest denial look like a claim. Measured; the fix is clause-scoped polarity, not a longer word list.
 - **`http_get` validates an address and then connects by name.** The module docstring claimed the request was pinned to the verified address via a custom transport; there is no such transport, so a DNS answer that changes between the check and the connection reaches an internal address. The response body is also buffered before its size is checked.
@@ -389,6 +392,7 @@ Each carries an `ARCHIVED.md` naming what it got wrong and how this repository a
 | 7 | Positioning, archived-repository pointers | **done** |
 | 8 | Approval service: approve / reject, modified-argument re-evaluation, and the approval queue the outbound gateway tells clients about | **done** |
 | 9 | Resuming the agent run after an approval, approval expiry, and reviewer notifications | **planned** |
+| 10 | Hardening from the adversarial audits: a junction-proof sandbox, `ATTACH` refusal in the read-only SQL tool, and POSIX-correct path resolution | **done** |
 
 The live path is verified against a stub on every build. A run against a **real** vendor needs a credential, and is an optional CI job gated on an `LLM_API_KEY` secret; without it the check reports `SKIPPED`, never a pass.
 
