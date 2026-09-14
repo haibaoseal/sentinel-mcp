@@ -35,6 +35,7 @@ from app.providers.base import (
     ProviderToolSpec,
 )
 from app.security.guardrails import GuardrailResult, check_input, check_output
+from app.trace import SpanStatus, Trace, TraceBuilder, TraceSpan
 
 SYSTEM_PROMPT = (
     "You are a tool-using assistant operating under a governance layer.\n"
@@ -84,6 +85,14 @@ class AgentRunResult:
     guardrail: Any = None
 
 
+@dataclass
+class TracedRun:
+    """A run's result together with its structured trace."""
+
+    result: AgentRunResult
+    trace: Trace
+
+
 class AgentLoop:
     def __init__(
         self,
@@ -110,13 +119,43 @@ class AgentLoop:
         ]
 
     def run(self, *, task_id: str, user_request: str, session: Session) -> AgentRunResult:
+        return self.run_traced(task_id=task_id, user_request=user_request, session=session).result
+
+    def run_traced(
+        self,
+        *,
+        task_id: str,
+        user_request: str,
+        session: Session,
+        scenario_id: str | None = None,
+    ) -> TracedRun:
+        """Run the agent and return both the result and a structured trace.
+
+        The trace is built from what actually happened -- the policy decision the
+        firewall recorded, the guardrail checks that ran -- rather than from a
+        reconstruction. A trace assembled after the fact would describe what the
+        code *would* decide, which is not evidence of what it did.
+        """
+        builder = TraceBuilder(
+            run_id=task_id,
+            question=user_request,
+            identity=self.provider.identity,
+            scenario_id=scenario_id,
+        )
+
         # Screen the request before any tool is proposed. A detected injection is a
         # *blocking* input finding, not a warning: the archived design treated
         # detection as advisory and then relied on the policy engine alone, which
         # meant an injection that only manipulated wording had no effect at all.
         input_check = check_input(user_request)
+        builder.guardrail_span(
+            name="guardrail.input",
+            verdict=input_check.verdict,
+            findings=[_finding_dict(f) for f in input_check.findings],
+            checks=input_check.checks,
+        )
         if not input_check.allowed:
-            return AgentRunResult(
+            result = AgentRunResult(
                 status="blocked",
                 answer=(
                     "请求已被输入防护拦截：检测到试图改变指令或获取系统提示的内容。"
@@ -135,7 +174,28 @@ class AgentLoop:
                 termination=TERMINATION_GUARDRAIL,
                 guardrail=input_check,
             )
+            return TracedRun(
+                result=result,
+                trace=builder.finish(
+                    answer=result.answer, status=result.status, termination=result.termination
+                ),
+            )
 
+        return self._run_loop(
+            task_id=task_id,
+            user_request=user_request,
+            session=session,
+            builder=builder,
+        )
+
+    def _run_loop(
+        self,
+        *,
+        task_id: str,
+        user_request: str,
+        session: Session,
+        builder: TraceBuilder,
+    ) -> TracedRun:
         messages: list[ProviderMessage] = [
             ProviderMessage(role="system", content=SYSTEM_PROMPT),
             ProviderMessage(role="user", content=user_request),
@@ -159,7 +219,8 @@ class AgentLoop:
                         detail=str(exc),
                     )
                 )
-                return AgentRunResult(
+                builder.model_span(name="model.error", model=self.provider.identity.model)
+                result = AgentRunResult(
                     status="failed",
                     answer=f"模型调用失败：{exc}",
                     steps=steps,
@@ -168,12 +229,21 @@ class AgentLoop:
                     usage=usage,
                     error=str(exc),
                 )
+                return TracedRun(
+                    result=result,
+                    trace=builder.finish(
+                        answer=result.answer, status=result.status, termination=result.termination
+                    ),
+                )
 
             if decision.usage:
                 usage = {**(usage or {}), **decision.usage}
 
             if decision.kind == "final_answer":
                 steps.append(LoopStep(index=turn, decision_kind="final_answer"))
+                builder.model_span(
+                    name="model.final_answer", model=self.provider.identity.model, usage=usage
+                )
                 status = _status_from(results)
                 answer = decision.final_answer or ""
                 # The model's closing text is only trustworthy when the run
@@ -198,6 +268,13 @@ class AgentLoop:
                     citations,
                     policy_relevant=bool(citations) and not governance_answer,
                 )
+                builder.guardrail_span(
+                    name="guardrail.output",
+                    verdict=output_check.verdict,
+                    findings=[_finding_dict(f) for f in output_check.findings],
+                    checks=output_check.checks,
+                )
+
                 if not output_check.allowed:
                     steps.append(
                         LoopStep(
@@ -209,24 +286,28 @@ class AgentLoop:
                     )
                     status = "failed" if status == "completed" else status
                     answer = _guardrail_refusal(output_check, answer)
-                    return AgentRunResult(
-                        status=status,
-                        answer=answer,
-                        steps=steps,
-                        tool_results=results,
-                        termination=TERMINATION_GUARDRAIL,
-                        usage=usage,
-                        guardrail=output_check,
-                    )
 
-                return AgentRunResult(
+                result = AgentRunResult(
                     status=status,
                     answer=answer,
                     steps=steps,
                     tool_results=results,
-                    termination=TERMINATION_COMPLETED,
+                    termination=(
+                        TERMINATION_GUARDRAIL if not output_check.allowed else TERMINATION_COMPLETED
+                    ),
                     usage=usage,
                     guardrail=output_check,
+                )
+                builder.add(
+                    TraceSpan(
+                        span_type="output", name="answer", status="ok", parent=builder.root_id
+                    )
+                )
+                return TracedRun(
+                    result=result,
+                    trace=builder.finish(
+                        answer=result.answer, status=result.status, termination=result.termination
+                    ),
                 )
 
             messages.append(
@@ -245,7 +326,7 @@ class AgentLoop:
                             detail="identical call already made with identical arguments",
                         )
                     )
-                    return AgentRunResult(
+                    result = AgentRunResult(
                         status="failed",
                         answer=(
                             f"已停止：模型重复请求同一个工具调用（{call.tool_name}），"
@@ -256,6 +337,23 @@ class AgentLoop:
                         termination=TERMINATION_REPEATED_CALL,
                         usage=usage,
                     )
+                    builder.add(
+                        TraceSpan(
+                            span_type="model",
+                            name="model.repeated_call",
+                            status="error",
+                            error_code="REPEATED_CALL",
+                            parent=builder.root_id,
+                        )
+                    )
+                    return TracedRun(
+                        result=result,
+                        trace=builder.finish(
+                            answer=result.answer,
+                            status=result.status,
+                            termination=result.termination,
+                        ),
+                    )
                 seen_calls.add(signature)
 
                 outcome = self._invoke(call, task_id=task_id, session=session)
@@ -264,7 +362,15 @@ class AgentLoop:
                 # guardrail can check the answer against the same chunks the agent
                 # actually saw. Without this the grounding check has nothing to
                 # compare against and silently passes everything.
-                citations.extend(_citations_from(outcome))
+                new_citations = _citations_from(outcome)
+                citations.extend(new_citations)
+                _record_call_spans(
+                    builder,
+                    firewall=self.firewall,
+                    call=call,
+                    outcome=outcome,
+                    citations=new_citations,
+                )
                 steps.append(
                     LoopStep(
                         index=turn,
@@ -293,13 +399,28 @@ class AgentLoop:
                 detail=f"loop did not finish within {self.max_turns} turns",
             )
         )
-        return AgentRunResult(
+        builder.add(
+            TraceSpan(
+                span_type="model",
+                name="model.max_turns",
+                status="error",
+                error_code="MAX_TURNS",
+                parent=builder.root_id,
+            )
+        )
+        result = AgentRunResult(
             status="failed",
             answer=f"未能在 {self.max_turns} 轮内完成请求。",
             steps=steps,
             tool_results=results,
             termination=TERMINATION_MAX_TURNS,
             usage=usage,
+        )
+        return TracedRun(
+            result=result,
+            trace=builder.finish(
+                answer=result.answer, status=result.status, termination=result.termination
+            ),
         )
 
     # -- helpers ------------------------------------------------------------
@@ -323,6 +444,72 @@ class AgentLoop:
             content=_render(result),
             error=result.error,
         )
+
+
+def _record_call_spans(
+    builder: TraceBuilder,
+    *,
+    firewall: Firewall,
+    call,
+    outcome: ProviderToolResult,
+    citations: list[dict[str, Any]],
+) -> None:
+    """Record the policy decision and the tool outcome as separate spans.
+
+    They are separate because they answer different questions: the policy span says
+    *why* a call was permitted, blocked or held, and the tool span says what then
+    happened. Folding them together loses the distinction between "allowed and
+    succeeded" and "allowed but failed".
+    """
+    decision = firewall.decisions.get(outcome.tool_call_id)
+    if decision is not None:
+        builder.policy_span(
+            span=TraceSpan(
+                span_type="policy",
+                name=f"policy.{call.tool_name}",
+                status="blocked" if decision.decision == "block" else "ok",
+                decision=decision.decision,
+                risk_level=decision.risk_level,
+                matched_rules=list(decision.matched_rules),
+                reasons=list(decision.reasons),
+                parent=builder.root_id,
+            )
+        )
+    builder.tool_span(
+        tool_name=call.tool_name,
+        status=_span_status(outcome.status),
+        source=firewall.registry.source_name(call.tool_name),
+        arguments=call.arguments,
+        error_code=outcome.error if outcome.status == "failed" else None,
+    )
+    if citations:
+        builder.add(
+            TraceSpan(
+                span_type="retrieval",
+                name=f"retrieval.{call.tool_name}",
+                citations=citations,
+                parent=builder.root_id,
+            )
+        )
+
+
+def _span_status(status: str) -> SpanStatus:
+    return {
+        "success": "ok",
+        "failed": "error",
+        "blocked": "blocked",
+        "waiting_approval": "held",
+    }.get(status, "ok")  # type: ignore[return-value]
+
+
+def _finding_dict(finding) -> dict[str, Any]:
+    return {
+        "name": finding.name,
+        "severity": finding.severity,
+        "reason": finding.reason,
+        "detail": finding.detail,
+        "matched": finding.matched,
+    }
 
 
 def _citations_from(outcome: ProviderToolResult) -> list[dict[str, Any]]:

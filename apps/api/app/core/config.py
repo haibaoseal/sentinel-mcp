@@ -14,7 +14,18 @@ from pathlib import Path
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
+# Path resolution lives in one place. Having config.py and the eval modules each
+# compute the repository root independently is how the knowledge base silently
+# stopped loading: the two guesses disagreed by one directory, and the only symptom
+# was an agent that answered every policy question with "no actionable steps".
+from app.core.paths import (
+    REPO_ROOT,
+)
+from app.core.paths import (
+    resolve_config_path as _resolve,
+)
+
+__all__ = ["Settings", "get_settings", "reset_settings_cache", "REPO_ROOT"]
 
 
 class Settings(BaseSettings):
@@ -97,28 +108,6 @@ class Settings(BaseSettings):
 
     def llm_configured(self) -> bool:
         return bool(self.llm_api_key and self.llm_model)
-
-
-def _resolve(value: str) -> Path:
-    """Resolve a configured path against the repository root.
-
-    Absolute paths are honoured as-is. A path that is only *accidentally*
-    absolute -- ``/sandbox`` or ``\\sandbox`` on Windows -- is treated as
-    relative to the repository root, because that is what a config author
-    almost certainly meant and silently reading ``C:\\sandbox`` would be a
-    confusing way to fail.
-    """
-    raw = value.strip()
-    path = Path(raw).expanduser()
-    if path.is_absolute():
-        drive, tail = path.drive, str(path)[len(path.drive) :]
-        # A bare root like "/sandbox" or "\sandbox" has no meaningful drive
-        # anchor, so treat it as repo-relative.
-        if tail.startswith(("/", "\\")) and not drive:
-            path = REPO_ROOT / tail.lstrip("/\\")
-        else:
-            return path.resolve()
-    return (REPO_ROOT / path).resolve()
 
 
 @lru_cache

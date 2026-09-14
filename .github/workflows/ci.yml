@@ -42,6 +42,13 @@ jobs:
       - name: Tests
         run: python -m pytest apps/api/app/tests -q
 
+      # The regression gate. Fails the build if a gated metric drops below the
+      # recorded baseline, or if the number of checks behind a metric shrinks while
+      # its rate stays at 1.0 -- the latter is how a suite is quietly hollowed out
+      # while still reporting a perfect score.
+      - name: Evaluation suite and regression gate
+        run: python -m app.evals.cli
+
       # Governance claims are executable, so CI runs the demonstrations too. If a
       # redaction shape regresses or the chain stops self-verifying, this fails
       # even if a unit test was quietly weakened.

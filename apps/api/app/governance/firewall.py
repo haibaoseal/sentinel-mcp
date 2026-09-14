@@ -30,7 +30,7 @@ from app.core.contracts import ToolDescriptor, ToolRequest, ToolResult
 from app.core.errors import SentinelError, ToolExecutionError, ToolNotFoundError
 from app.core.security import new_id, utcnow
 from app.db.models import PolicyDecisionRecord, ToolCall
-from app.policy.engine import PolicyEngine
+from app.policy.engine import PolicyDecision, PolicyEngine
 from app.tools.registry import ToolRegistry
 
 
@@ -47,6 +47,12 @@ class Firewall:
         self.policy_engine = policy_engine or PolicyEngine()
         self.runtime_flags = runtime_flags or {}
         self.hmac_key = hmac_key
+        # Decision per tool_call_id, so a caller building a trace can record *why*
+        # a call was allowed, blocked or held without re-evaluating the policy.
+        # Re-evaluating would be wrong: policy can change between the decision and
+        # the trace, and a trace must describe the decision that was actually made.
+        self.decisions: dict[str, PolicyDecision] = {}
+        self._decision_order: list[str] = []
 
     # -- public API ---------------------------------------------------------
 
@@ -60,6 +66,12 @@ class Firewall:
         decision = self.policy_engine.evaluate(request, runtime_flags=self.runtime_flags)
         descriptor = self.registry.describe(request.tool_name)
         tool_call_id = new_id()
+        self.decisions[tool_call_id] = decision
+        self._decision_order.append(tool_call_id)
+        # Keep the map bounded: a long-lived process should not accumulate one entry
+        # per call forever.
+        while len(self._decision_order) > 1000:
+            self.decisions.pop(self._decision_order.pop(0), None)
 
         tool_call = self._persist_proposal(session, request, decision, descriptor, tool_call_id)
         audit = AuditLogger(session, hmac_key=self.hmac_key)

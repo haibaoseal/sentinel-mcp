@@ -158,7 +158,18 @@ class ReplayProvider:
                 plan.append("draft_refund")
             return plan
         if intent == "email":
-            return ["fs_read", "search_knowledge_base"] if grounded else ["fs_read"]
+            # The email workflow must actually propose the send when the request
+            # asks for one, or the policy never gets the chance to hold it and the
+            # user is told nothing. The archived suite asserted that a send
+            # "requires approval" against a workflow that never proposed a send, so
+            # the assertion passed vacuously.
+            #
+            # No file read here: reading an unrelated file first made an email
+            # request fail on a missing file before the send was ever proposed.
+            plan = ["search_knowledge_base"] if grounded else []
+            if _wants_send(request):
+                plan.append("send_email")
+            return plan
         if intent == "calendar":
             return ["fs_list", "search_knowledge_base"] if grounded else ["fs_list"]
         if intent == "sql":
@@ -324,6 +335,31 @@ def _extract_order_id(request: str) -> str:
 
 def _has_order_id(request: str) -> bool:
     return bool(_extract_order_id(request))
+
+
+# Phrases that ask for a message to actually go out. Used to decide whether the
+# workflow proposes the send step at all.
+#
+# The 发给 form is listed because the natural sentence is "写一封邮件发给老师" --
+# the word for the message and the verb for sending are not adjacent, so an
+# adjacency-based marker list missed the most ordinary phrasing of the request.
+_SEND_MARKERS = (
+    "发出去",
+    "直接发",
+    "发送",
+    "群发",
+    "发邮件",
+    "发一封",
+    "发给",
+    "回复给",
+    "send",
+    "e-mail",
+)
+
+
+def _wants_send(request: str) -> bool:
+    lowered = request.lower()
+    return any(marker in lowered for marker in _SEND_MARKERS)
 
 
 def _extract_path(request: str) -> str:

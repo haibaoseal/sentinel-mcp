@@ -146,6 +146,11 @@ class PolicyEngine:
                 f"{request.tool_name} is marked default_block because it can cause "
                 "irreversible changes."
             )
+            # Record the specific rule, not just the tool. A trace that says only
+            # "tools.delete_file matched" cannot distinguish "the tool is known"
+            # from "this rule is what blocked it", which is the question a reviewer
+            # is actually asking.
+            matched.append(f"tools.{request.tool_name}.default_block")
             return "block"
         if bool(rule.get("approval_required", False)):
             reasons.append(

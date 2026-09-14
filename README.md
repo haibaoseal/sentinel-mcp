@@ -6,7 +6,7 @@ The premise of this project is that the hard part of shipping an agent is not ma
 
 `sentinel-mcp` sits between an agent and every tool it can reach — local Python functions and remote MCP servers alike — and makes each proposed call pass a policy decision, an optional human approval, and an append-only audit chain.
 
-> **Status: Phases 0–4 of a staged build.** The governance core, the provider-abstracted agent loop, the real tools, the MCP gateway (both directions) and the guardrails are implemented and tested. The evaluation harness and regression gate are next. See [Roadmap](#roadmap).
+> **Status: Phases 0–5 of a staged build.** The governance core, the provider-abstracted agent loop, the real tools, the MCP gateway (both directions), the guardrails, and the evaluation harness with a regression gate are implemented and tested. Remaining: live smoke test and final positioning. See [Roadmap](#roadmap).
 
 ## Why this exists
 
@@ -79,7 +79,10 @@ python -m pip install -e ".[dev]" -c constraints.txt
 ```bash
 python scripts/demo_agent.py        # four requests, four governance outcomes
 python scripts/demo_mcp_gateway.py  # the gateway, in both directions
+python scripts/demo_guardrails.py   # every bypass the archived build allowed
 python scripts/verify_p0_fixes.py   # audit-chain and redaction guarantees, live
+
+PYTHONPATH=apps/api python -m app.evals.cli   # the eval suite and the regression gate
 ```
 
 `demo_agent.py` runs the whole stack — provider, loop, policy, approval, audit — and prints:
@@ -206,6 +209,33 @@ Raw token overlap with no IDF means high-frequency function characters decide th
 Path checks run on the *resolved* path with `strict=False`, so containment does not depend on the target existing. Checking the raw string would accept `../../etc/passwd`; checking after an existence test would report an escape attempt as "file not found", which is both a worse message and a weaker boundary.
 
 
+## Evaluation: a gate, not a dashboard
+
+```bash
+PYTHONPATH=apps/api python -m app.evals.cli
+```
+
+Exit codes: `0` clean, `1` a scenario failed, `2` a gated metric regressed, `3` a scenario contract violation.
+
+The scenarios and the verified metrics live in version control (`evals/scenarios.json`, `evals/baseline.json`), and CI fails the build on a regression. Three properties make the gate worth having:
+
+**Scoring reads the trace, not the run.** Expectations are checked against the `Trace` the loop produced, which is built from the policy decisions the firewall actually recorded. A score cannot be improved by changing how a run is reported — only by changing what it did.
+
+**Every scenario is contract-checked against the registry before it runs.** This is the direct fix for a defect measured in the archived suite: a scenario asserted that `delete_calendar_event` was blocked, but no such tool existed. The assertion passed because nothing could run, and the green cell hid the hole. A scenario naming an unregistered tool is now a **configuration error that stops the suite** (exit 3). Unknown *negative* expectations are checked too, because `must_not_execute: [ghost]` is trivially true.
+
+**Two kinds of regression are caught, and the second is the easy one to miss.**
+
+1. **Rate drop** — fewer of the checks that ran passed.
+2. **Evidence shrink** — the *number* of checks fell while the rate stayed at `1.0`. Deleting or weakening assertions removes checks, and 3-of-3 and 8-of-8 both report `1.0`. A rate-only gate certifies a hollowed-out suite, so the count is gated as well. Both are verified by deliberately breaking the baseline and confirming exit code 2.
+
+Metrics report their own denominators, and a metric with no checks is reported as **absent** rather than as a perfect score — the archived suite returned `1.0` for an empty metric set, so a metric that measured nothing printed as 100%.
+
+The report states in its own text what kind of measurement it is. A stored artifact cannot be read later as a model benchmark, because it says: `deterministic workflow run -- NOT a model-quality measurement`.
+
+### Timing is excluded from evaluation on purpose
+
+Spans carry no wall-clock duration. A fixture run must produce a byte-identical trace every time, and a duration makes that impossible. The archived project had a test that "verified determinism" while its DTO contained timestamps, so the assertion could only ever compare fields that happened to be stable. Latency belongs in an operational metric, not in a value an eval score depends on.
+
 ## What is verified, and how
 
 This project's central claim is that its safety properties are measured rather than asserted. Concretely:
@@ -263,8 +293,8 @@ Stated plainly, because overclaiming safety is worse than having none:
 | 2 | Real tools: sandboxed filesystem, BM25 knowledge retrieval, maintenance tools | **done** |
 | 3 | MCP gateway: inbound client and outbound server, stdio and Streamable HTTP | **done** |
 | 4 | Input guardrails, per-id citation binding, capability-boundary checks | **done** |
-| 5 | Unified trace DTO, deterministic evaluation, regression gate that fails CI on a score drop | next |
-| 6 | End-to-end tests, live smoke test, deployment | planned |
+| 5 | Unified trace model, deterministic evaluation, regression gate | **done** |
+| 6 | Live smoke test against a real model | next |
 | 7 | Positioning and interview narrative | planned |
 
 ## Repository layout
