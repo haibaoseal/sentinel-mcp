@@ -119,6 +119,17 @@ tools:
     constraints:
       read_only: true
 
+  sql_schema:
+    action_type: read
+    risk: low
+    approval_required: false
+    # Deliberately NOT `constraints.read_only`. That constraint means "the supplied
+    # query string must be a read-only statement", which requires a `query` argument
+    # -- and this tool takes none, so the constraint blocked it with "read-only but no
+    # query was supplied". Its read-only property is structural instead: it uses the
+    # same connection opened with mode=ro as sql_query, and it only reads PRAGMA
+    # metadata.
+
   http_get:
     action_type: read
     risk: medium

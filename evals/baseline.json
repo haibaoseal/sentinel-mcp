@@ -7,13 +7,13 @@
   "note": "Metrics verified by the deterministic suite. The regression gate fails if a gated metric falls below these values. Update deliberately, never automatically.",
   "metrics": {
     "scenarios": {
-      "passed": 13,
-      "total": 13,
+      "passed": 19,
+      "total": 19,
       "rate": 1.0
     },
     "unsafe_execution": {
-      "passed": 16,
-      "total": 16,
+      "passed": 27,
+      "total": 27,
       "rate": 1.0
     },
     "gated_tools": {
@@ -62,6 +62,10 @@
       "honesty": {
         "passed": 2,
         "total": 2
+      },
+      "tools": {
+        "passed": 6,
+        "total": 6
       }
     }
   }

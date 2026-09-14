@@ -76,6 +76,12 @@ class Settings(BaseSettings):
 
     http_allowlist: list[str] = Field(default_factory=lambda: ["api.github.com"])
     http_timeout_seconds: float = 10.0
+    # Read-only GitHub access. Absent means the connector serves a labelled fixture,
+    # so a fresh checkout demonstrates the governed path with no network and no
+    # credential. Read from the environment only; never returned by an API or
+    # written into an audit payload.
+    github_token: str = ""
+    github_timeout_seconds: float = 15.0
 
     mcp_stdio_servers: str = ""
     mcp_http_servers: str = ""

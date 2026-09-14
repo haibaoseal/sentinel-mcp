@@ -21,8 +21,11 @@ from app.providers.base import Provider
 from app.providers.replay import ReplayProvider
 from app.tools.registry import ToolRegistry
 from app.tools.sources.filesystem import FilesystemSandbox, build_filesystem_source
+from app.tools.sources.github import build_github_source
+from app.tools.sources.http import build_http_source
 from app.tools.sources.knowledge import build_knowledge_source
 from app.tools.sources.maintenance import build_maintenance_source
+from app.tools.sources.sql import build_sql_source
 
 
 class ConfigurationError(SentinelError):
@@ -115,6 +118,9 @@ def build_registry(
     sources: list[ToolSource] = [
         build_filesystem_source(sandbox),
         build_maintenance_source(sandbox),
+        build_sql_source(sandbox.root / "commerce.db"),
+        build_http_source(settings.http_allowlist),
+        build_github_source(token=settings.github_token or None),
     ]
     knowledge = settings.knowledge_path
     if knowledge.is_dir():

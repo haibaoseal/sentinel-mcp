@@ -78,12 +78,32 @@ python -m pip install -e ".[dev]" -c constraints.txt
 
 ```bash
 python scripts/demo_agent.py        # four requests, four governance outcomes
+python scripts/demo_tools.py        # real tools through the governed path
 python scripts/demo_mcp_gateway.py  # the gateway, in both directions
 python scripts/demo_guardrails.py   # every bypass the archived build allowed
 python scripts/verify_p0_fixes.py   # audit-chain and redaction guarantees, live
 
 PYTHONPATH=apps/api python -m app.evals.cli   # the eval suite and the regression gate
 ```
+
+## The tools, and what each refusal rests on
+
+| Tool | Real? | The guarantee |
+|---|---|---|
+| `fs_read`, `fs_list`, `fs_search` | yes | Path containment checked on the **resolved** path, so `..` traversal and symlink escape are refused |
+| `search_knowledge_base` | yes | BM25 retrieval with a relevance floor; line ranges counted against the original file |
+| `sql_query`, `sql_schema` | yes | SQLite opened with `mode=ro`, so a write **cannot** occur — a structural guarantee, not a pattern match on the query string |
+| `sql_execute_write` | inert | Registered so the `default_block` rule has something to block; refuses independently if invoked directly |
+| `http_get` | yes | Host allow-list, **plus** a resolved-address check refusing private/loopback/link-local, **plus** no redirect following, **plus** `trust_env=False` |
+| `http_post` | inert | No non-GET code path exists; an external action is a separate policy decision, not a flag |
+| `github_list_*`, `github_read_*` | yes | GET only. Live when `GITHUB_TOKEN` is set, otherwise a fixture whose every result says `source: fixture` |
+| `github_close_issue`, `github_post_issue_comment` | inert | Registered and disabled by policy; refuse independently. Rate limits are surfaced rather than reported as an empty list |
+| `send_email`, `draft_refund`, `delete_file`, `write_file_draft` | inert | Dry run. `delete_file` is `default_block` and the tool refuses independently |
+
+Two of these design points are worth stating plainly, because both were mistakes in the archived code:
+
+- **The inert tools are registered on purpose.** A policy rule for a tool that does not exist proves nothing: "it did not run" is true for the wrong reason. The archived project had exactly that — a `delete_file` rule and a scenario asserting deletion was blocked, with no such tool. Now every "blocked" assertion has a reachable tool behind it, and the scenario contract check enforces this: a scenario naming an unregistered tool stops the suite.
+- **The SQL guarantee does not depend on the query string.** The policy engine also rejects non-SELECT statements, but that is a decision made by matching text a caller controls. `mode=ro` plus `PRAGMA query_only` means the connection physically cannot write, which is the layer that still holds if the pattern is wrong.
 
 `demo_agent.py` runs the whole stack — provider, loop, policy, approval, audit — and prints:
 

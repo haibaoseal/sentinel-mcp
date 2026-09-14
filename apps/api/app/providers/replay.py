@@ -32,7 +32,9 @@ from app.providers.base import (
     ProviderToolSpec,
 )
 
-Intent = Literal["delete", "refund", "email", "calendar", "sql", "file", "github", "unknown"]
+Intent = Literal[
+    "delete", "refund", "email", "calendar", "sql", "http", "file", "github", "unknown"
+]
 
 
 # Intent detection. Deliberately small and readable: this provider's purpose is
@@ -62,7 +64,9 @@ _INTENT_MARKERS: tuple[tuple[Intent, tuple[str, ...]], ...] = (
     # SQL/order-status markers are deliberately specific: bare 查询 ("query") and
     # bare 订单 ("order") also appear in file, refund and email requests, so
     # matching on them misroutes those. 订单状态 is unambiguous.
-    ("sql", ("数据库", "sql", "orders", "订单状态", "订单号", "数据表")),
+    ("sql", ("数据库", "sql", "orders", "订单状态", "订单号", "订单表", "数据表", "表结构")),
+    # A URL in the request is the clearest signal that a fetch is wanted.
+    ("http", ("http://", "https://", "抓取", "抓一下", "fetch ", "curl ")),
     ("file", ("文件", "目录", "file", "notes")),
     ("github", ("github", "issue", "pull request", " pr ", "连接器")),
 )
@@ -173,7 +177,16 @@ class ReplayProvider:
         if intent == "calendar":
             return ["fs_list", "search_knowledge_base"] if grounded else ["fs_list"]
         if intent == "sql":
+            # A schema request wants the schema; anything else wants a query. Both
+            # are read-only, and a destructive SQL request is *not* routed to
+            # sql_execute_write: proposing a blocked tool would make the answer look
+            # like a failed mutation rather than a refusal, and the refusal is the
+            # honest outcome. The intent that matters is that nothing executed.
+            if _wants_schema(request):
+                return ["sql_schema"]
             return ["search_knowledge_base", "sql_query"] if grounded else ["sql_query"]
+        if intent == "http":
+            return ["http_get"]
         if intent == "file":
             # Search first so the workflow has an evidence step, but only when
             # the request did not already name a file: searching for "policy"
@@ -210,8 +223,17 @@ class ReplayProvider:
             return {"pattern": path or _keyword(request)}
         if tool_name == "fs_list":
             return {"path": "."}
-        if tool_name == "github_list_issues":
+        if tool_name in {"sql_schema"}:
+            return {}
+        if tool_name in {"github_list_issues", "github_list_pull_requests"}:
             return {"owner": "openai", "repo": "openai-python"}
+        if tool_name == "http_get":
+            url = _extract_url(request)
+            if not url:
+                # No URL to fetch: return an argument the tool will refuse, rather
+                # than inventing a destination the user never named.
+                return {"url": ""}
+            return {"url": url}
         return {}
 
     def _answer(self, request: str, results: Sequence[ProviderToolResult]) -> str:
@@ -280,14 +302,32 @@ def detect_intent(request: str) -> Intent:
     for intent, markers in _ACTION_MARKERS:
         if any(marker in lowered for marker in markers):
             return intent
-    # A concrete file path or a read verb identifies a filesystem request more
-    # reliably than any topic noun.
+    # A concrete file path or a read verb identifies a filesystem request -- but only
+    # when nothing more specific is named. "读一下订单表" and "看一下这个 issue" both
+    # contain a read verb, and an over-broad read-verb rule sent them to the file
+    # plan. An explicit database, URL or issue reference outranks a generic verb.
+    if _mentions_database(request) or _wants_fetch(request) or _mentions_github(request):
+        for intent, markers in _INTENT_MARKERS:
+            if any(marker in lowered for marker in markers):
+                return intent
     if _PATH_RE.search(request) or any(verb in lowered for verb in _READ_VERBS):
         return "file"
     for intent, markers in _INTENT_MARKERS:
         if any(marker in lowered for marker in markers):
             return intent
     return "unknown"
+
+
+def _mentions_database(request: str) -> bool:
+    return any(
+        marker in request.lower()
+        for marker in ("数据库", "sql", "orders", "订单表", "数据表", "表结构", "字段")
+    )
+
+
+def _mentions_github(request: str) -> bool:
+    lowered = request.lower()
+    return "github" in lowered or "issue" in lowered or "pull request" in lowered
 
 
 def _first_user_message(messages: Sequence[ProviderMessage]) -> str:
@@ -335,6 +375,40 @@ def _extract_order_id(request: str) -> str:
 
 def _has_order_id(request: str) -> bool:
     return bool(_extract_order_id(request))
+
+
+# Asking about the shape of the data rather than its contents. Kept separate from
+# the query plan so the agent does not run an arbitrary SELECT to answer "what
+# tables exist".
+_SCHEMA_MARKERS = ("表结构", "有哪些表", "schema", "字段", "列名", "columns")
+
+
+def _wants_schema(request: str) -> bool:
+    lowered = request.lower()
+    return any(marker in lowered for marker in _SCHEMA_MARKERS)
+
+
+# Requests asking to fetch a URL, as opposed to describing one.
+_FETCH_MARKERS = ("http://", "https://", "抓取", "抓一下", "获取网页", "fetch ", "curl ")
+
+
+def _wants_fetch(request: str) -> bool:
+    lowered = request.lower()
+    return any(marker in lowered for marker in _FETCH_MARKERS)
+
+
+_URL_RE = re.compile(r"https?://[^\s，。、；;）)】\]\"']+", re.IGNORECASE)
+
+
+def _extract_url(request: str) -> str:
+    """The URL named in the request, or empty.
+
+    Empty rather than a default: substituting a destination makes the agent fetch
+    something the user never asked for, and the answer then looks plausible while
+    being about the wrong resource.
+    """
+    match = _URL_RE.search(request)
+    return match.group(0).rstrip(".,;:") if match else ""
 
 
 # Phrases that ask for a message to actually go out. Used to decide whether the

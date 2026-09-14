@@ -115,6 +115,12 @@ jobs:
       - name: Guardrail demo
         run: python scripts/demo_guardrails.py
 
+      # Exercises the real tools through the governed path: read-only SQL (which runs
+      # on a mode=ro connection), a blocked SQL write, the labelled GitHub fixture,
+      # a disabled GitHub write tool, and an HTTP allow-list refusal.
+      - name: Real tools demo
+        run: python scripts/demo_tools.py
+
   # Guards the property that makes this project worth reading: tool execution has
   # exactly one authorised path. Adding a transport (MCP over stdio or HTTP) must
   # not create a second, ungoverned route to a tool.
