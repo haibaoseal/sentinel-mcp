@@ -12,8 +12,10 @@ from pathlib import Path
 
 from app.agent.loop import AgentLoop
 from app.core.config import Settings, get_settings
+from app.core.contracts import ToolSource
 from app.core.errors import SentinelError
 from app.governance.firewall import Firewall
+from app.mcp.client import MCPClient, MCPServerSpec, MCPToolSource
 from app.policy.engine import PolicyEngine, load_policy_document
 from app.providers.base import Provider
 from app.providers.replay import ReplayProvider
@@ -60,19 +62,80 @@ def build_provider(settings: Settings) -> Provider:
     raise ConfigurationError(f"unknown AGENT_PROVIDER {name!r}; expected 'replay' or 'llm'")
 
 
-def build_registry(settings: Settings, *, sandbox_root: Path | None = None) -> ToolRegistry:
+def parse_mcp_specs(settings: Settings) -> list[MCPServerSpec]:
+    """Build MCP server specs from configuration.
+
+    Two syntaxes, both comma-separated:
+
+    - stdio: ``name=command arg1 arg2``  e.g. ``demo=python mcp_servers/demo_server.py stdio``
+    - http:  ``name=url``                e.g. ``remote=http://127.0.0.1:8765/mcp``
+
+    Governance mapping is deliberately *not* expressible here. Which remote tools
+    may run unattended is decided in the policy file, so authorising a remote
+    tool is a reviewable change rather than a command-line flag.
+    """
+    specs: list[MCPServerSpec] = []
+
+    for entry in _split_entries(settings.mcp_stdio_servers):
+        name, _, remainder = entry.partition("=")
+        if not name.strip() or not remainder.strip():
+            raise ConfigurationError(f"invalid MCP_STDIO_SERVERS entry: {entry!r}")
+        parts = remainder.split()
+        specs.append(
+            MCPServerSpec(
+                name=name.strip(),
+                transport="stdio",
+                command=parts[0],
+                args=parts[1:],
+            )
+        )
+
+    for entry in _split_entries(settings.mcp_http_servers):
+        name, _, url = entry.partition("=")
+        if not name.strip() or not url.strip():
+            raise ConfigurationError(f"invalid MCP_HTTP_SERVERS entry: {entry!r}")
+        specs.append(MCPServerSpec(name=name.strip(), transport="http", url=url.strip()))
+
+    return specs
+
+
+def _split_entries(value: str) -> list[str]:
+    return [entry.strip() for entry in value.split(",") if entry.strip()]
+
+
+def build_registry(
+    settings: Settings,
+    *,
+    sandbox_root: Path | None = None,
+    enable_mcp: bool = False,
+) -> ToolRegistry:
     sandbox = FilesystemSandbox(sandbox_root or settings.sandbox_path)
-    sources = [build_filesystem_source(sandbox), build_maintenance_source(sandbox)]
+    # Local sources first, so a remote server cannot take over a local name.
+    sources: list[ToolSource] = [
+        build_filesystem_source(sandbox),
+        build_maintenance_source(sandbox),
+    ]
     knowledge = settings.knowledge_path
     if knowledge.is_dir():
         sources.append(build_knowledge_source(knowledge))
+
+    if enable_mcp:
+        specs = parse_mcp_specs(settings)
+        if specs:
+            sources.append(MCPToolSource([MCPClient(spec) for spec in specs]))
+
     return ToolRegistry(sources)
 
 
-def build_runtime(settings: Settings | None = None, *, sandbox_root: Path | None = None) -> Runtime:
+def build_runtime(
+    settings: Settings | None = None,
+    *,
+    sandbox_root: Path | None = None,
+    enable_mcp: bool = False,
+) -> Runtime:
     resolved = settings or get_settings()
     policy = load_policy_document(resolved.policy_path or None)
-    registry = build_registry(resolved, sandbox_root=sandbox_root)
+    registry = build_registry(resolved, sandbox_root=sandbox_root, enable_mcp=enable_mcp)
     firewall = Firewall(
         registry=registry,
         policy_engine=PolicyEngine(policy),

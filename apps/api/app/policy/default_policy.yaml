@@ -48,6 +48,36 @@ tools:
     risk: low
     approval_required: false
 
+  # --- Example: individually reviewed MCP tools -----------------------------
+  # A server's tools are NOT granted by naming the server. Each remote tool that
+  # an operator wants to run unattended is declared here by its qualified name,
+  # so the approval decision is visible in review. Everything else a server
+  # advertises falls through to `defaults.unknown_tool` (require_approval).
+  #
+  # The mapping declared on the server spec (`tool_actions`) controls the risk
+  # *label* placed on the discovered descriptor; this file controls whether the
+  # call is allowed. Both are required, deliberately: relabelling a remote tool
+  # must not be sufficient to authorise it.
+  mcp.demo.repo_stats:
+    action_type: read
+    risk: low
+    approval_required: false
+  mcp.demo.count_pattern:
+    action_type: read
+    risk: low
+    approval_required: false
+  mcp.demo.echo:
+    action_type: read
+    risk: low
+    approval_required: false
+  # scratch_write has real side effects, so it is held for approval even though
+  # the demo maps it explicitly. This is the line a reviewer should check.
+  mcp.demo.scratch_write:
+    action_type: write
+    risk: high
+    approval_required: true
+    side_effect: real
+
   # -------------------------------------------------------------------------
   # Local read-only tools
   # -------------------------------------------------------------------------

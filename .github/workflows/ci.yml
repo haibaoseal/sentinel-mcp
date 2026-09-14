@@ -34,19 +34,31 @@ jobs:
         run: python -m pip install -e ".[dev]"
 
       - name: Lint
-        run: python -m ruff check apps/api/app scripts
+        run: python -m ruff check apps/api/app mcp_servers scripts
 
       - name: Format check
-        run: python -m ruff format --check apps/api/app scripts
+        run: python -m ruff format --check apps/api/app mcp_servers scripts
 
       - name: Tests
         run: python -m pytest apps/api/app/tests -q
 
-      # Governance claims are executable, so CI runs the demonstration too. If a
-      # redaction shape regresses or the chain stops self-verifying, this step
-      # fails even if a unit test was quietly weakened.
+      # Governance claims are executable, so CI runs the demonstrations too. If a
+      # redaction shape regresses or the chain stops self-verifying, this fails
+      # even if a unit test was quietly weakened.
       - name: Verify governance guarantees
         run: python scripts/verify_p0_fixes.py
+
+      # Spawns a real MCP server over stdio and drives it through the firewall.
+      # Requires the MCP SDK, which the [dev] extra does not include because the
+      # outbound half of the gateway has no such dependency.
+      - name: Install MCP extra
+        run: python -m pip install "mcp>=1.9,<3.0"
+
+      - name: MCP gateway demo
+        run: python scripts/demo_mcp_gateway.py
+
+      - name: Governed agent demo
+        run: python scripts/demo_agent.py
 
   # Guards the property that makes this project worth reading: tool execution has
   # exactly one authorised path. Adding a transport (MCP over stdio or HTTP) must
@@ -103,3 +115,21 @@ jobs:
             exit 1
           fi
           echo "Firewall requires a session."
+
+      - name: MCP tools are governed, not granted
+        shell: bash
+        run: |
+          set -euo pipefail
+          # A discovered MCP tool must not default to a permissive action type.
+          # If this default ever became something other than "unknown", every new
+          # MCP server would silently gain authority.
+          if ! grep -q 'tool_actions.get(remote_name, "unknown")' apps/api/app/mcp/client.py; then
+            echo "::error::Unmapped MCP tools no longer default to the 'unknown' action type."
+            exit 1
+          fi
+          # Child processes must not inherit the operator's whole environment.
+          if ! grep -q 'ENV_ALLOWLIST' apps/api/app/mcp/client.py; then
+            echo "::error::MCP stdio children no longer use an environment allow-list."
+            exit 1
+          fi
+          echo "MCP discovery remains fail-closed."

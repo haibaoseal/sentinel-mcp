@@ -6,7 +6,7 @@ The premise of this project is that the hard part of shipping an agent is not ma
 
 `sentinel-mcp` sits between an agent and every tool it can reach — local Python functions and remote MCP servers alike — and makes each proposed call pass a policy decision, an optional human approval, and an append-only audit chain.
 
-> **Status: Phases 0–2 of a staged build.** The governance core (policy engine, audit chain, redaction), the provider-abstracted agent loop and the real tools (sandboxed filesystem, BM25 retrieval) are implemented and tested. The MCP transports are next. See [Roadmap](#roadmap).
+> **Status: Phases 0–3 of a staged build.** The governance core, the provider-abstracted agent loop, the real tools and the MCP gateway (both directions) are implemented and tested. The evaluation harness and regression gate are next. See [Roadmap](#roadmap).
 
 ## Why this exists
 
@@ -69,8 +69,9 @@ python -m ruff format --check apps/api/app scripts
 ### Watch the agent get governed
 
 ```bash
-python scripts/demo_agent.py     # four requests, four different governance outcomes
-python scripts/verify_p0_fixes.py  # audit-chain and redaction guarantees, live
+python scripts/demo_agent.py        # four requests, four governance outcomes
+python scripts/demo_mcp_gateway.py  # the gateway, in both directions
+python scripts/verify_p0_fixes.py   # audit-chain and redaction guarantees, live
 ```
 
 `demo_agent.py` runs the whole stack — provider, loop, policy, approval, audit — and prints:
@@ -97,6 +98,52 @@ LLM_BASE_URL=https://api.deepseek.com/v1   # Kimi, Qwen, vLLM, a local gateway�
 ```
 
 The governance path is byte-for-byte the same one the offline provider uses, so an eval result is comparable between the two. `ProviderIdentity.is_live` records which one produced any given trace, which is what stops a replay score being presented as model quality.
+
+## The MCP gateway, in both directions
+
+This is the part of the project aimed squarely at agent-infrastructure work, and it is the reason the `ToolSource` abstraction exists.
+
+### Inbound: the agent calls tools on a remote MCP server
+
+```bash
+# .env — comma-separated
+MCP_STDIO_SERVERS=demo=python mcp_servers/demo_server.py stdio
+MCP_HTTP_SERVERS=remote=http://127.0.0.1:8765/mcp
+```
+
+Remote tools are discovered, namespaced `mcp.<server>.<tool>` and registered in the same registry as local tools. They are then subject to the same policy decision, the same approval workflow and the same audit record — the firewall does not know MCP exists.
+
+Three properties are enforced rather than documented:
+
+1. **A discovered tool is not a trusted tool.** A tool the operator has not mapped becomes `action_type="unknown"`, and the policy engine escalates `unknown` to `require_approval`. So the default effect of plugging in a new server is that its tools are *visible and reviewable*, not that they can run unattended. There is deliberately no wildcard that grants a whole server.
+2. **A remote server cannot shadow a local tool.** Names are namespaced and the registry refuses duplicate names outright rather than picking a winner, because two tools with one name and different behaviour is exactly the ambiguity an attacker benefits from.
+3. **A server does not inherit the operator's environment.** Stdio children are spawned with an allow-listed environment (`PATH`, `HOME`, `TEMP`…), so "start a tool server" does not silently hand it every credential you have exported.
+
+### Outbound: this runtime *is* an MCP server
+
+The same firewall can publish its governed tools to an external client — Cursor, Claude Desktop, another agent framework:
+
+```bash
+# PYTHONPATH is required: the package lives at apps/api, and an editable install
+# of a *different* project named `app` would otherwise shadow it.
+PYTHONPATH=apps/api python -m app.mcp.serve --transport stdio
+# Windows PowerShell: $env:PYTHONPATH="apps/api"; python -m app.mcp.serve --transport stdio
+
+PYTHONPATH=apps/api python -m app.mcp.serve --transport http --port 8765
+```
+
+A foreign client still cannot reach a tool except through the firewall. Each call creates its own task, its own audit chain and its own policy decision. Two details matter:
+
+- **Governance metadata is published.** Each tool is described with its action type, risk level and whether approval is required, so a client can warn its user before a gated call rather than having the refusal look arbitrary.
+- **A held call is reported as held, not as an error.** MCP tool calls expect a result, so an approval-gated call returns `status: waiting_approval` with `is_error=False` and an explicit note that nothing was executed. Reporting it as a failure would invite the client to retry a gated action; reporting success would be a lie.
+
+### Concurrency: why the async boundary sits where it does
+
+MCP transports are async and use anyio task groups, which must be entered and exited by the same task. A connection therefore runs as one long-lived worker task that owns its whole lifecycle, with requests passed over queues. Asynchrony is confined to `app/mcp/client.py`; the policy engine, firewall and audit log stay synchronous on purpose, because a governance decision should not depend on an event loop being driven correctly.
+
+### A note on running the CLI
+
+`PYTHONPATH=apps/api` is needed because the package root is `apps/api`. This is worth knowing because the failure mode is confusing: `python -m app.mcp.serve` can pick up an *unrelated* `app` package if another project in the same Python environment installed one (an editable install of a different project, for example), and the error then names `app.mcp` rather than the shadowing package. `pip install -e ".[dev]"` from this repository makes `app.mcp.serve` resolve correctly.
 
 ## Design notes worth reading
 
@@ -139,6 +186,11 @@ This project's central claim is that its safety properties are measured rather t
 | Path traversal, absolute paths and symlink escape are refused | `test_filesystem_sandbox.py` |
 | Citation line ranges point at the cited content | `test_knowledge_retrieval.py::test_line_range_points_at_the_real_content` |
 | An unrelated question returns no citations instead of weak matches | `test_knowledge_retrieval.py::test_unrelated_query_returns_nothing` |
+| An unmapped remote MCP tool is held for approval, not trusted | `test_mcp_gateway.py::test_unmapped_remote_tool_defaults_to_unknown_action` |
+| MCP stdio children get an allow-listed environment, not the operator's | `test_mcp_gateway.py::test_child_environment_is_an_allowlist` |
+| A remote server cannot shadow a local tool name | `test_mcp_gateway.py::test_a_remote_tool_cannot_shadow_a_local_tool` |
+| A remote failure is a failure, not a silent success | `test_mcp_gateway.py::test_remote_error_is_surfaced_as_a_tool_failure` |
+| No client leaks an external call past policy | `test_mcp_server.py::test_external_client_destructive_call_is_blocked_over_stdio` |
 
 ### Two defects these tests exist to prevent
 
@@ -165,17 +217,13 @@ Stated plainly, because overclaiming safety is worse than having none:
 | 0 | Governance core: contracts, policy engine, audit chain, redaction, CI | **done** |
 | 1 | Provider-abstracted agent loop (real model when a key is present, deterministic replay otherwise) | **done** |
 | 2 | Real tools: sandboxed filesystem, BM25 knowledge retrieval, maintenance tools | **done** |
-| 3 | MCP gateway: client and server, stdio and Streamable HTTP transports | in progress |
-| 4 | Per-id citation binding, contradiction-aware output guardrails, bilingual injection detection | planned |
+| 3 | MCP gateway: inbound client and outbound server, stdio and Streamable HTTP | **done** |
+| 4 | Per-id citation binding, contradiction-aware output guardrails, bilingual injection detection | next |
 | 5 | Unified trace DTO, deterministic evaluation, regression gate that fails CI on a score drop | planned |
 | 6 | End-to-end tests, live smoke test, deployment | planned |
 | 7 | Positioning and interview narrative | planned |
 
-Note that Phase 4 and Phase 3 are partly independent, and Phase 4 fixes are
-already justified by measurement rather than speculation: the archived guardrail
-allowed "退款草案会直接完成退款" to pass while citing the very excerpt that
-contradicts it, and its injection detector did not catch the plain English
-phrase "Ignore all previous instructions".
+Phase 4 fixes are already justified by measurement rather than speculation: the archived guardrail allowed "退款草案会直接完成退款" to pass while citing the very excerpt that contradicts it, and its injection detector did not catch the plain English phrase "Ignore all previous instructions".
 
 ## Repository layout
 
