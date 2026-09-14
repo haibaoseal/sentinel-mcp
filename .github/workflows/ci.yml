@@ -49,6 +49,49 @@ jobs:
       - name: Evaluation suite and regression gate
         run: python -m app.evals.cli
 
+      # Exercises the *live* code path -- HTTP client, request encoding, response
+      # decoding, runtime assembly, live trace marking, governance under a real
+      # provider -- against a local OpenAI-compatible stub. No network and no key,
+      # but it is the path a real model takes, and it is where the nested tool_calls
+      # encoding bug was found.
+      - name: Live path against a local stub
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/mock_llm_stub.py 8799 &
+          STUB=$!
+          trap 'kill $STUB 2>/dev/null || true' EXIT
+          # Wait for the port rather than sleeping a fixed amount.
+          for _ in $(seq 1 40); do
+            if python -c "import socket,sys; socket.create_connection(('127.0.0.1',8799),1).close()" 2>/dev/null; then
+              break
+            fi
+            sleep 0.25
+          done
+          LLM_API_KEY=ci-not-a-secret \
+          LLM_MODEL=ci-stub-model \
+          LLM_BASE_URL=http://127.0.0.1:8799/v1 \
+            python scripts/live_smoke.py
+
+      # Reported as SKIPPED (exit 77), never as a pass: a real vendor cannot be
+      # reached from CI without a secret, and "we did not run this" is not "this
+      # works". Configure the LLM_API_KEY secret to enable it.
+      - name: Live smoke against a real model (optional)
+        continue-on-error: true
+        env:
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          LLM_MODEL: ${{ secrets.LLM_MODEL }}
+          LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}
+        run: |
+          python scripts/live_smoke.py || code=$?
+          code=${code:-0}
+          if [ "$code" = "77" ]; then
+            echo "::notice::live smoke skipped: no LLM_API_KEY secret configured"
+          elif [ "$code" != "0" ]; then
+            echo "::error::live smoke failed against a real model"
+            exit "$code"
+          fi
+
       # Governance claims are executable, so CI runs the demonstrations too. If a
       # redaction shape regresses or the chain stops self-verifying, this fails
       # even if a unit test was quietly weakened.

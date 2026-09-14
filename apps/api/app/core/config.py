@@ -53,6 +53,11 @@ class Settings(BaseSettings):
     llm_model: str = ""
     llm_base_url: str = ""
     llm_timeout_seconds: float = 60.0
+    # Whether the host's HTTP proxy configuration applies to model requests.
+    # Default False: a proxy meant for internet traffic is frequently wrong for a
+    # local or custom base URL, and the failure -- a bare 502 with an empty body --
+    # is indistinguishable from a broken backend.
+    llm_use_system_proxy: bool = False
     max_agent_turns: int = 8
 
     # --- real side effects, all off by default -----------------------------

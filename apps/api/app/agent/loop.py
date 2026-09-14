@@ -310,8 +310,18 @@ class AgentLoop:
                     ),
                 )
 
+            # The assistant turn carries the calls it requested, not only a prose
+            # description of them. A real vendor requires the structured form for the
+            # tool results that follow ("tool message without a preceding tool
+            # call"), and without it the provider cannot tell which tools have already
+            # run, so it re-proposes them -- which the loop then reports as a repeated
+            # call. Found by running the live path against a stub.
             messages.append(
-                ProviderMessage(role="assistant", content=_describe_calls(decision.tool_calls))
+                ProviderMessage(
+                    role="assistant",
+                    content=_describe_calls(decision.tool_calls),
+                    tool_calls=list(decision.tool_calls),
+                )
             )
 
             for call in decision.tool_calls:

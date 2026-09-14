@@ -45,6 +45,7 @@ class LLMProvider:
         timeout: float = DEFAULT_TIMEOUT_SECONDS,
         temperature: float = 0.0,
         client: httpx.Client | None = None,
+        use_system_proxy: bool = False,
     ) -> None:
         if not api_key:
             raise ProviderError("LLM provider requires an API key", retryable=False)
@@ -55,7 +56,17 @@ class LLMProvider:
         self._base_url = base_url.rstrip("/")
         self._timeout = timeout
         self._temperature = temperature
-        self._client = client
+        # One client for the lifetime of the provider: the previous version built a
+        # fresh client per request, which discards connection pooling and leaks
+        # transport resources on a long-lived agent.
+        #
+        # `trust_env` defaults to False for the same reason it does in the MCP
+        # client: a proxy configured for internet traffic is frequently wrong for a
+        # custom or local base URL, and the failure is a bare 502 with an empty body
+        # that looks exactly like a broken backend. Measured on the development
+        # machine, where a system proxy turned every request into a 502.
+        self._client = client or httpx.Client(timeout=timeout, trust_env=use_system_proxy)
+        self._owns_client = client is None
         self._identity = ProviderIdentity(
             provider="llm", model=model, is_live=True, base_url=self._base_url
         )
@@ -63,6 +74,11 @@ class LLMProvider:
     @property
     def identity(self) -> ProviderIdentity:
         return self._identity
+
+    def close(self) -> None:
+        """Release the transport, if this provider created it."""
+        if self._owns_client:
+            self._client.close()
 
     def decide(
         self,
@@ -107,12 +123,7 @@ class LLMProvider:
 
         for _attempt in range(1, MAX_ATTEMPTS + 1):
             try:
-                if self._client is not None:
-                    response = self._client.post(
-                        url, json=payload, headers=headers, timeout=self._timeout
-                    )
-                else:
-                    response = httpx.post(url, json=payload, headers=headers, timeout=self._timeout)
+                response = self._client.post(url, json=payload, headers=headers)
             except httpx.TimeoutException as exc:
                 last_error = ProviderError(
                     f"LLM request timed out after {self._timeout}s", retryable=True
@@ -162,6 +173,27 @@ def _encode_message(message: ProviderMessage) -> dict[str, Any]:
             "role": "tool",
             "tool_call_id": message.tool_call_id or "",
             "content": message.content,
+        }
+    if message.role == "assistant" and message.tool_calls:
+        # A tool result must follow an assistant message carrying a matching
+        # tool_calls entry. Describing the calls in prose instead is rejected by a
+        # real vendor ("tool message without a preceding tool call"), and it leaves
+        # the model unable to tell what has already run, so it re-proposes them.
+        return {
+            "role": "assistant",
+            "content": message.content or None,
+            "tool_calls": [
+                {
+                    "id": call.id,
+                    "type": "function",
+                    "function": {
+                        "name": call.tool_name,
+                        # The wire format wants arguments as a JSON string.
+                        "arguments": json.dumps(call.arguments, ensure_ascii=False),
+                    },
+                }
+                for call in message.tool_calls
+            ],
         }
     return {"role": message.role, "content": message.content}
 

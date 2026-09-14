@@ -45,6 +45,14 @@ class ProviderMessage(BaseModel):
     # Populated on a ``tool`` message so the model can see what its call returned.
     tool_call_id: str | None = None
     tool_name: str | None = None
+    # Populated on the ``assistant`` message that requested tool calls.
+    #
+    # This is required by OpenAI-compatible APIs: a tool result message must follow
+    # an assistant message whose ``tool_calls`` array contains a matching id. The
+    # loop originally described its calls in prose instead, which works against a
+    # permissive stub but is rejected by a real vendor -- and it also means the
+    # provider cannot tell which tools have already run, so it re-proposes them.
+    tool_calls: list[ProviderToolCall] = Field(default_factory=list)
 
 
 class ProviderToolCall(BaseModel):

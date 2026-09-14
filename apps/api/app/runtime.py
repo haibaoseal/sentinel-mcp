@@ -58,6 +58,7 @@ def build_provider(settings: Settings) -> Provider:
             model=settings.llm_model,
             base_url=settings.llm_base_url or DEFAULT_BASE_URL,
             timeout=settings.llm_timeout_seconds,
+            use_system_proxy=settings.llm_use_system_proxy,
         )
     raise ConfigurationError(f"unknown AGENT_PROVIDER {name!r}; expected 'replay' or 'llm'")
 
