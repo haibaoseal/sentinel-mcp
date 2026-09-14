@@ -56,6 +56,12 @@ tools:
     risk: low
     approval_required: false
 
+  # Read-only tools run unattended: that is what makes the runtime usable. The
+  # real control on them is not approval but confinement -- see
+  # `constraints.sandboxed`, the path check in FilesystemSandbox.resolve, and
+  # the read_only SQL allow-list. A policy that demanded approval for every file
+  # read would simply train reviewers to click through, which is worse than not
+  # asking.
   fs_read:
     action_type: read
     risk: medium
@@ -70,6 +76,11 @@ tools:
     approval_required: false
     constraints:
       sandboxed: true
+
+  search_knowledge_base:
+    action_type: read
+    risk: low
+    approval_required: false
 
   sql_query:
     action_type: read
@@ -106,10 +117,10 @@ tools:
     approval_required: false
 
   # -------------------------------------------------------------------------
-  # Local write tools. All require approval, and none touch the outside world
-  # by default (`side_effect: real` keeps them behind runtime flags).
+  # Local write / destructive / external tools. All require approval, and the
+  # ones marked `side_effect: real` stay behind a runtime flag as well.
   # -------------------------------------------------------------------------
-  fs_write_draft:
+  write_file_draft:
     action_type: write
     risk: medium
     approval_required: true

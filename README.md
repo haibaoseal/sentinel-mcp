@@ -6,7 +6,7 @@ The premise of this project is that the hard part of shipping an agent is not ma
 
 `sentinel-mcp` sits between an agent and every tool it can reach — local Python functions and remote MCP servers alike — and makes each proposed call pass a policy decision, an optional human approval, and an append-only audit chain.
 
-> **Status: Phase 0 of a staged build.** The governance core (policy engine, audit chain, redaction, contracts) is implemented and tested. The LLM agent loop, MCP transports and the evaluation harness are in progress. See [Roadmap](#roadmap).
+> **Status: Phases 0–2 of a staged build.** The governance core (policy engine, audit chain, redaction), the provider-abstracted agent loop and the real tools (sandboxed filesystem, BM25 retrieval) are implemented and tested. The MCP transports are next. See [Roadmap](#roadmap).
 
 ## Why this exists
 
@@ -61,18 +61,65 @@ python -m venv .venv
 # POSIX:   source .venv/bin/activate
 python -m pip install -e ".[dev]"
 
-python -m pytest apps/api/app/tests   # 109 tests
+python -m pytest apps/api/app/tests   # 183 tests
 python -m ruff check apps/api/app scripts
 python -m ruff format --check apps/api/app scripts
 ```
 
-### Prove the governance guarantees
+### Watch the agent get governed
 
 ```bash
-python scripts/verify_p0_fixes.py
+python scripts/demo_agent.py     # four requests, four different governance outcomes
+python scripts/verify_p0_fixes.py  # audit-chain and redaction guarantees, live
 ```
 
-This prints, live: an audit chain of events that all share one timestamp verifying successfully and then failing on tampering, plus twelve credential/PII shapes being redacted.
+`demo_agent.py` runs the whole stack — provider, loop, policy, approval, audit — and prints:
+
+| Request | Outcome |
+|---|---|
+| 普通商品多久可以退货？ | `completed` — retrieves policy evidence and answers |
+| 订单 ORD-1001 申请退款 | `waiting_approval` — financial action held for a human |
+| 帮我删除文件 notes.md | `blocked` — with all three policy reasons listed |
+| 读取 missing.md 的内容 | `failed` — reports the tool error, does **not** claim success |
+
+Each of those four runs leaves a hash chain that verifies, and the script then tampers with one event to show detection at the exact sequence number.
+
+### Point it at a real model
+
+The loop is provider-agnostic. Any OpenAI-compatible endpoint works:
+
+```bash
+# .env
+AGENT_PROVIDER=llm
+LLM_API_KEY=sk-...
+LLM_MODEL=deepseek-chat
+LLM_BASE_URL=https://api.deepseek.com/v1   # Kimi, Qwen, vLLM, a local gateway…
+```
+
+The governance path is byte-for-byte the same one the offline provider uses, so an eval result is comparable between the two. `ProviderIdentity.is_live` records which one produced any given trace, which is what stops a replay score being presented as model quality.
+
+## Design notes worth reading
+
+### The agent loop is stateless between turns
+
+Everything the provider needs is in the message list, so a run can be reconstructed from its transcript. A provider that keeps its plan in instance state cannot be replayed from a log — and an unexplainable audit trail is not an audit trail.
+
+### The loop never executes a tool
+
+It asks the firewall, which applies policy and writes the audit record. The firewall is the only caller of a tool source, and CI fails if a stray `.execute(` appears anywhere else.
+
+### A failed, blocked or held call is never reported as success
+
+The loop derives run status from what actually happened and **overrides the model's closing text** whenever the status is not `completed`. This is a deliberate answer to a specific defect: the archived implementation started from `status = "passed"`, so an internal schema-validation string reached a user under a green badge.
+
+### Retrieval uses BM25, not overlap
+
+Raw token overlap with no IDF means high-frequency function characters decide the ranking. Measured on the archived code: 64% of one query's score came from single characters, and an unrelated question ("今天天气怎么样") returned three "citations" because the only filter was `score > 0`. Matching now keys off CJK bigrams with real IDF and a relative relevance floor, so an unrelated question returns nothing — which is the honest answer.
+
+### The filesystem sandbox resolves before it compares
+
+Path checks run on the *resolved* path with `strict=False`, so containment does not depend on the target existing. Checking the raw string would accept `../../etc/passwd`; checking after an existence test would report an escape attempt as "file not found", which is both a worse message and a weaker boundary.
+
 
 ## What is verified, and how
 
@@ -86,6 +133,12 @@ This project's central claim is that its safety properties are measured rather t
 | Secrets and Chinese PII are redacted (15 credential shapes, 7 PII shapes) | `test_redaction.py` — asserts the **absence** of a discriminating substring |
 | Unknown tools, unknown actions and destructive tools fail closed | `test_policy_engine.py` |
 | Read-only SQL cannot be escaped by stacked statements or comments | `test_policy_engine.py` |
+| A failed tool call is never answered with the model's success claim | `test_agent_loop.py::test_failed_run_is_not_reported_as_success` |
+| A repeated identical call stops the loop instead of burning turns | `test_agent_loop.py::test_identical_repeated_call_is_detected_before_the_turn_limit` |
+| Every executed call has a matching audit record and a verifying chain | `test_agent_loop.py::test_every_executed_call_has_an_audit_record` |
+| Path traversal, absolute paths and symlink escape are refused | `test_filesystem_sandbox.py` |
+| Citation line ranges point at the cited content | `test_knowledge_retrieval.py::test_line_range_points_at_the_real_content` |
+| An unrelated question returns no citations instead of weak matches | `test_knowledge_retrieval.py::test_unrelated_query_returns_nothing` |
 
 ### Two defects these tests exist to prevent
 
@@ -102,16 +155,17 @@ Stated plainly, because overclaiming safety is worse than having none:
 - **The audit chain is unkeyed by default.** It detects modification, deletion and reordering of stored events. It cannot resist an attacker who rewrites the entire table from genesis, because nothing outside the database pins the head. An optional HMAC key closes that gap; it is not on by default. `test_unkeyed_chain_is_rewritable_from_genesis` asserts this weakness so it cannot be quietly forgotten.
 - **Redaction is deny-by-shape.** It recognises enumerated formats. A secret in a format nobody anticipated will pass through. It raises the cost of a leak; it does not make one impossible.
 - **This is a governance prototype**, not certified security software. Production use would need RBAC, tenant isolation, immutable external audit storage, and rate limiting.
-- **Phase 0 has no LLM loop yet.** The agent that proposes tool calls, and the MCP transports that serve remote ones, are the next stages. Nothing here claims to measure model quality.
+- **The offline provider is a scripted workflow, not a model.** It decides from accumulated tool results rather than from question keywords, so the loop is genuinely iterative — but its "intelligence" is written down, not learned. Scores from it must never be presented as model quality, which is why `ProviderIdentity.is_live` travels with every run.
+- **No MCP transports yet.** Phase 3. Nothing here claims MCP support today.
 
 ## Roadmap
 
 | Phase | Scope | State |
 |---|---|---|
 | 0 | Governance core: contracts, policy engine, audit chain, redaction, CI | **done** |
-| 1 | Provider-abstracted agent loop (real model when a key is present, deterministic replay otherwise) | next |
-| 2 | Real tools: sandboxed filesystem, read-only SQL, HTTP with allow-list, read-only GitHub | planned |
-| 3 | MCP gateway: client and server, stdio and Streamable HTTP transports | planned |
+| 1 | Provider-abstracted agent loop (real model when a key is present, deterministic replay otherwise) | **done** |
+| 2 | Real tools: sandboxed filesystem, BM25 knowledge retrieval, maintenance tools | **done** |
+| 3 | MCP gateway: client and server, stdio and Streamable HTTP transports | next |
 | 4 | Per-id citation binding, contradiction-aware output guardrails, bilingual injection detection | planned |
 | 5 | Unified trace DTO, deterministic evaluation, regression gate that fails CI on a score drop | planned |
 | 6 | End-to-end tests, live smoke test, deployment | planned |
@@ -121,13 +175,19 @@ Stated plainly, because overclaiming safety is worse than having none:
 
 ```text
 apps/api/app/
-  core/       contracts (ToolRequest, ToolDescriptor, ToolSource), typed errors
+  core/       contracts (ToolRequest, ToolDescriptor, ToolSource), config, typed errors
   policy/     YAML rules + evaluator
   audit/      hash-chained append-only log
   security/   secret and PII redaction
+  providers/  Provider protocol, offline ReplayProvider, OpenAI-compatible LLMProvider
+  agent/      the governed agent loop
+  governance/ the firewall: the single execution boundary
+  tools/      registry + sources (filesystem sandbox, BM25 knowledge, maintenance)
   db/         SQLAlchemy models
   tests/      pytest suite
-scripts/      operator-facing verification scripts
+knowledge/    versioned policy documents that citations point into
+sandbox/      the only directory the filesystem tools can touch
+scripts/      operator-facing verification and demo scripts
 ```
 
 ## Licence
