@@ -95,6 +95,21 @@ def test_row_limit_is_clamped(sql_source):
     assert result["truncated"] is True
 
 
+def test_truncated_means_there_was_more(sql_source):
+    """A result exactly as long as the limit is the whole result, not a truncation.
+
+    The flag used to be ``len(rows) == row_limit``, so a complete five-row answer at
+    a limit of five reported itself as truncated.
+    """
+    whole = sql_source.execute("sql_query", {"query": "SELECT * FROM orders", "row_limit": 5})
+    assert whole["row_count"] == 5
+    assert whole["truncated"] is False
+
+    clipped = sql_source.execute("sql_query", {"query": "SELECT * FROM orders", "row_limit": 4})
+    assert clipped["row_count"] == 4
+    assert clipped["truncated"] is True
+
+
 def test_absurd_row_limit_is_clamped_not_rejected(sql_source):
     result = sql_source.execute("sql_query", {"query": "SELECT * FROM orders", "row_limit": 10**9})
     assert result["row_limit"] <= 200

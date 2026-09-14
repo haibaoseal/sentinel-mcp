@@ -122,7 +122,11 @@ def build_sql_source(database: Path) -> LocalToolSource:
             connection.execute("PRAGMA query_only = ON")
             cursor = connection.execute(query)
             columns = [description[0] for description in cursor.description or []]
-            rows = cursor.fetchmany(row_limit)
+            # One row past the limit, so "truncated" means "there was more" rather
+            # than "the result happened to be exactly the limit long".
+            rows = cursor.fetchmany(row_limit + 1)
+            truncated = len(rows) > row_limit
+            rows = rows[:row_limit]
         except sqlite3.OperationalError as exc:
             # A read-only connection reports a write attempt as an operational
             # error; surfacing it as INVALID_ARGS keeps it distinguishable from an
@@ -143,7 +147,7 @@ def build_sql_source(database: Path) -> LocalToolSource:
             "rows": [list(row) for row in rows],
             "row_count": len(rows),
             "row_limit": row_limit,
-            "truncated": len(rows) == row_limit,
+            "truncated": truncated,
         }
 
     def describe_schema(arguments: dict[str, Any]) -> dict[str, Any]:

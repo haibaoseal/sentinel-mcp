@@ -19,15 +19,11 @@
 # exactly what has been verified. Regenerate after upgrading deliberately.
 #
 # Verified environment: Python 3.13.13
-alembic==1.18.5
-fastapi==0.139.0
 httpx==0.28.1
 mcp==2.2.0
 pydantic==2.13.4
 pydantic-settings==2.14.2
 pytest==9.1.1
-python-multipart==0.0.32
 PyYAML==6.0.3
 ruff==0.15.20
 SQLAlchemy==2.0.51
-uvicorn==0.49.0

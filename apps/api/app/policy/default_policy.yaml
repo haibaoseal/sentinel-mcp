@@ -9,6 +9,15 @@
 # `side_effect: real` marks a tool that touches the outside world. Those are
 # refused unless the matching runtime flag is switched on, so the default
 # posture of a fresh checkout is that nothing real is ever mutated.
+#
+# Two blocks per rule describe constraints, and they differ in who reads them:
+#
+#   constraints:            the engine *enforces* these (currently `read_only`).
+#   documented_guarantees:  a note for a human reader. The enforcement lives in
+#                           the tool implementation and nothing in the engine
+#                           reads these keys. An earlier version put them under
+#                           `constraints`, where deleting one looked like it
+#                           would widen access and changed nothing at all.
 version: "1.0"
 
 defaults:
@@ -96,7 +105,7 @@ tools:
     action_type: read
     risk: medium
     approval_required: false
-    constraints:
+    documented_guarantees:
       sandboxed: true
       max_bytes: 262144
 
@@ -104,7 +113,7 @@ tools:
     action_type: read
     risk: low
     approval_required: false
-    constraints:
+    documented_guarantees:
       sandboxed: true
 
   search_knowledge_base:
@@ -134,7 +143,7 @@ tools:
     action_type: read
     risk: medium
     approval_required: false
-    constraints:
+    documented_guarantees:
       allowlist_required: true
 
   github_list_issues:
@@ -165,7 +174,7 @@ tools:
     action_type: write
     risk: medium
     approval_required: true
-    constraints:
+    documented_guarantees:
       sandboxed: true
 
   sql_execute_write:
@@ -180,7 +189,7 @@ tools:
     risk: high
     approval_required: true
     side_effect: real
-    constraints:
+    documented_guarantees:
       allowlist_required: true
 
   github_post_issue_comment:
@@ -246,10 +255,14 @@ sensitive_patterns:
       - "cvv"
       - "iban"
 
+# ---------------------------------------------------------------------------
+# Risk escalation. Read by the engine as a *floor*: a ruleset may raise one of
+# these levels and never lower it, so `destructive_action: low` cannot switch a
+# critical escalation off. These three keys are the ones with an implementation;
+# `external_recipient`, `contains_secret` and `modifies_database` used to sit here
+# reading like controls while nothing read them.
+# ---------------------------------------------------------------------------
 risk_escalation:
-  external_recipient: high
   destructive_action: critical
   financial_action: critical
-  contains_secret: critical
-  modifies_database: high
   sends_message: high

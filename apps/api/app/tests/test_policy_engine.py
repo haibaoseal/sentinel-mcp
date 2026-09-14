@@ -261,3 +261,38 @@ def test_matched_rules_and_reasons_are_always_populated(engine):
         decision = decide(engine, name, action_type=action)
         assert decision.reasons, name
         assert decision.matched_rules, name
+
+
+# --- configured risk levels ---------------------------------------------------
+
+
+def _policy_with_escalation(level: str) -> dict:
+    return {
+        "defaults": {"unknown_tool": "require_approval", "unknown_action": "require_approval"},
+        "known_action_types": ["read", "write", "external_send", "destructive", "financial"],
+        "tools": {
+            "delete_file": {
+                "action_type": "destructive",
+                "risk": "low",
+                "approval_required": True,
+            }
+        },
+        "risk_escalation": {"destructive_action": level},
+    }
+
+
+def test_a_ruleset_may_raise_a_risk_level():
+    """`risk_escalation` is read, which it was not: the levels were hardcoded."""
+    decision = PolicyEngine(_policy_with_escalation("critical")).evaluate(
+        ToolRequest(tool_name="delete_file", action_type="destructive")
+    )
+    assert decision.risk_level == "critical"
+    assert "risk_escalation.destructive_action" in decision.matched_rules
+
+
+def test_a_ruleset_may_never_lower_a_risk_level():
+    """A configured level is a floor: `destructive_action: low` cannot switch it off."""
+    decision = PolicyEngine(_policy_with_escalation("low")).evaluate(
+        ToolRequest(tool_name="delete_file", action_type="destructive")
+    )
+    assert decision.risk_level == "critical"

@@ -75,12 +75,6 @@ class ToolDescriptor(BaseModel):
     source: str = "local"
 
 
-class ToolExecution(BaseModel):
-    """The outcome a binding reports, before it becomes a ToolResult."""
-
-    data: dict[str, Any] = Field(default_factory=dict)
-
-
 @runtime_checkable
 class ToolSource(Protocol):
     """A supplier of executable tools.
@@ -103,17 +97,6 @@ class ToolSource(Protocol):
 
 # Signature for a single tool implementation inside a local source.
 LocalToolFn = Callable[[dict[str, Any]], dict[str, Any]]
-
-
-@runtime_checkable
-class AsyncToolSource(Protocol):
-    """Async variant, needed because MCP transports are inherently async."""
-
-    name: str
-
-    async def descriptors(self) -> list[ToolDescriptor]: ...
-
-    async def execute(self, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]: ...
 
 
 AsyncToolFn = Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]

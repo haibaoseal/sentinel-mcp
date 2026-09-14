@@ -183,18 +183,30 @@ class PolicyEngine:
             reasons.append(f"Unrecognised action_type {request.action_type!r} requires approval.")
             matched.append("defaults.unknown_action")
         if request.action_type == "external_send":
-            risk = max_risk(risk, "high")
+            risk = max_risk(risk, self._configured_risk("sends_message", "high"))
             reasons.append("External send actions can affect people outside the system.")
             matched.append("risk_escalation.sends_message")
         if request.action_type == "destructive":
-            risk = max_risk(risk, "critical")
+            risk = max_risk(risk, self._configured_risk("destructive_action", "critical"))
             reasons.append("Destructive actions are critical risk.")
             matched.append("risk_escalation.destructive_action")
         if request.action_type == "financial":
-            risk = max_risk(risk, "critical")
+            risk = max_risk(risk, self._configured_risk("financial_action", "critical"))
             reasons.append("Financial actions move value and are treated as critical risk.")
             matched.append("risk_escalation.financial_action")
         return risk
+
+    def _configured_risk(self, key: str, floor: str) -> str:
+        """The higher of the built-in floor and what the ruleset asks for.
+
+        This is what makes ``risk_escalation`` in the YAML a control rather than
+        documentation: it was three hardcoded levels with six keys beside them, three
+        of which nothing read. Configuration may raise a level and never lower one --
+        a ruleset that says ``destructive_action: low`` must not be able to switch a
+        critical escalation off.
+        """
+        configured = str((self.policy.get("risk_escalation") or {}).get(key, floor))
+        return max_risk(floor, configured)
 
     def _scan_sensitive_arguments(
         self,
