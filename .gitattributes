@@ -1,0 +1,10 @@
+# Normalise line endings so a Windows checkout and a Linux CI run produce
+# byte-identical files. Without this, git rewrites LF to CRLF on checkout,
+# which silently changes hashes, fixtures and diff noise.
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.ico binary
+*.pdf binary
+*.db binary

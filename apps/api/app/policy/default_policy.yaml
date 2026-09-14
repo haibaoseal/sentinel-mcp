@@ -1,0 +1,203 @@
+# Policy ruleset for the governed MCP runtime.
+#
+# Design posture: every rule fails closed. A tool that is absent from `tools`
+# is NOT allowed -- it falls through to `defaults.unknown_tool` and requires
+# human approval. That is deliberate: adding a new tool (including one that
+# appears at runtime from a remote MCP server) must never silently widen what
+# the agent can do.
+#
+# `side_effect: real` marks a tool that touches the outside world. Those are
+# refused unless the matching runtime flag is switched on, so the default
+# posture of a fresh checkout is that nothing real is ever mutated.
+version: "1.0"
+
+defaults:
+  unknown_tool: require_approval
+  unknown_action: require_approval
+
+known_action_types:
+  - read
+  - write
+  - external_send
+  - destructive
+  - financial
+  - unknown
+
+connectors:
+  defaults:
+    real_connectors_enabled: false
+    real_write_actions_enabled: false
+    real_destructive_actions_enabled: false
+    real_external_actions_enabled: false
+
+# ---------------------------------------------------------------------------
+# MCP namespace
+# ---------------------------------------------------------------------------
+# Tools discovered from MCP servers are registered under `mcp.<server>.<tool>`.
+# Because they are not listed below individually, they inherit
+# `defaults.unknown_tool` = require_approval. An operator who wants a specific
+# remote tool to run unattended must name it explicitly; there is no wildcard
+# that grants a whole server.
+tools:
+  mcp_list_servers:
+    action_type: read
+    risk: low
+    approval_required: false
+  mcp_list_tools:
+    action_type: read
+    risk: low
+    approval_required: false
+
+  # -------------------------------------------------------------------------
+  # Local read-only tools
+  # -------------------------------------------------------------------------
+  fs_list:
+    action_type: read
+    risk: low
+    approval_required: false
+
+  fs_read:
+    action_type: read
+    risk: medium
+    approval_required: false
+    constraints:
+      sandboxed: true
+      max_bytes: 262144
+
+  fs_search:
+    action_type: read
+    risk: low
+    approval_required: false
+    constraints:
+      sandboxed: true
+
+  sql_query:
+    action_type: read
+    risk: medium
+    approval_required: false
+    constraints:
+      read_only: true
+
+  http_get:
+    action_type: read
+    risk: medium
+    approval_required: false
+    constraints:
+      allowlist_required: true
+
+  github_list_issues:
+    action_type: read
+    risk: low
+    approval_required: false
+
+  github_read_issue:
+    action_type: read
+    risk: low
+    approval_required: false
+
+  github_list_pull_requests:
+    action_type: read
+    risk: low
+    approval_required: false
+
+  github_read_pull_request:
+    action_type: read
+    risk: low
+    approval_required: false
+
+  # -------------------------------------------------------------------------
+  # Local write tools. All require approval, and none touch the outside world
+  # by default (`side_effect: real` keeps them behind runtime flags).
+  # -------------------------------------------------------------------------
+  fs_write_draft:
+    action_type: write
+    risk: medium
+    approval_required: true
+    constraints:
+      sandboxed: true
+
+  sql_execute_write:
+    action_type: destructive
+    risk: critical
+    approval_required: true
+    default_block: true
+    side_effect: real
+
+  http_post:
+    action_type: external_send
+    risk: high
+    approval_required: true
+    side_effect: real
+    constraints:
+      allowlist_required: true
+
+  github_post_issue_comment:
+    action_type: external_send
+    risk: high
+    approval_required: true
+    enabled: false
+    side_effect: real
+
+  github_close_issue:
+    action_type: destructive
+    risk: critical
+    approval_required: true
+    default_block: true
+    enabled: false
+    side_effect: real
+
+  send_email:
+    action_type: external_send
+    risk: high
+    approval_required: true
+    side_effect: real
+
+  delete_file:
+    action_type: destructive
+    risk: critical
+    approval_required: true
+    default_block: true
+    side_effect: real
+
+  draft_refund:
+    action_type: financial
+    risk: high
+    approval_required: true
+
+# ---------------------------------------------------------------------------
+# Sensitive-data detection in arguments. Scanned as substrings against the
+# lowercased JSON of the arguments, so a hit escalates to critical risk and
+# forces approval for an otherwise-allowed tool.
+# ---------------------------------------------------------------------------
+sensitive_patterns:
+  - name: credentials
+    patterns:
+      - "password"
+      - "passwd"
+      - "api_key"
+      - "apikey"
+      - "secret"
+      - "token"
+      - "private_key"
+      - "bearer "
+  - name: personal_identifier
+    patterns:
+      - "ssn"
+      - "passport"
+      - "身份证"
+      - "银行卡"
+      - "社保"
+  - name: payment
+    patterns:
+      - "credit_card"
+      - "card_number"
+      - "cvv"
+      - "iban"
+
+risk_escalation:
+  external_recipient: high
+  destructive_action: critical
+  financial_action: critical
+  contains_secret: critical
+  modifies_database: high
+  sends_message: high

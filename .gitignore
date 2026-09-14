@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Secrets: never commit a real key. .env.example is the only template.
+.env
+.env.*
+!.env.example
+
+# Local runtime state
+*.db
+*.db-journal
+*.sqlite3
+*.log
+data/
+eval_reports/*
+!eval_reports/latest.md
+!eval_reports/sample_report.md
+
+# Node
+node_modules/
+.next/
+out/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

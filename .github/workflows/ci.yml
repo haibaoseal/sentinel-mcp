@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel superseded runs rather than queueing them.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Fast, hermetic checks. No network, no API keys, no model calls: the whole
+  # point of the provider abstraction is that a contributor without a key can
+  # still verify every governance guarantee.
+  test:
+    name: lint + tests
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install
+        run: python -m pip install -e ".[dev]"
+
+      - name: Lint
+        run: python -m ruff check apps/api/app scripts
+
+      - name: Format check
+        run: python -m ruff format --check apps/api/app scripts
+
+      - name: Tests
+        run: python -m pytest apps/api/app/tests -q
+
+      # Governance claims are executable, so CI runs the demonstration too. If a
+      # redaction shape regresses or the chain stops self-verifying, this step
+      # fails even if a unit test was quietly weakened.
+      - name: Verify governance guarantees
+        run: python scripts/verify_p0_fixes.py
+
+  # Guards the property that makes this project worth reading: no module outside
+  # the designated execution boundary may execute a tool. Adding a new transport
+  # must not create a second, ungoverned path.
+  boundary:
+    name: execution boundary
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: No tool execution outside the firewall
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Sources may describe and run tools. Everything else must route
+          # through Firewall.execute().
+          violations=$(grep -rn --include='*.py' -E '\.execute\(' apps/api/app \
+            | grep -v 'apps/api/app/tools/sources/' \
+            | grep -v 'apps/api/app/governance/firewall.py' \
+            | grep -v 'apps/api/app/tests/' \
+            | grep -v 'ToolSource' \
+            || true)
+          if [ -n "$violations" ]; then
+            echo "Tool execution found outside the governed path:"
+            echo "$violations"
+            exit 1
+          fi
+          echo "Execution boundary intact."
