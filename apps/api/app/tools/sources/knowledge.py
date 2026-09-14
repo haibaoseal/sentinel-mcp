@@ -233,10 +233,15 @@ class KnowledgeIndex:
             return []
         scored.sort(key=lambda item: (-item[0], item[1].id))
         best = scored[0][0]
+        # A floor of two matched terms is right for a sentence and impossible for a
+        # word: "退款" yields exactly one bigram, so it could never retrieve anything,
+        # on a corpus that is entirely about refunds. The requirement is relative to
+        # what the query offers rather than fixed.
+        required_terms = min(MIN_MATCHED_TERMS, len(terms))
         kept = [
             (score, chunk, matched)
             for score, chunk, matched in scored
-            if score >= best * floor and matched >= MIN_MATCHED_TERMS
+            if score >= best * floor and matched >= required_terms
         ]
         if not kept:
             return []

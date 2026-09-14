@@ -170,3 +170,37 @@ def test_ordinary_text_is_left_alone():
     """Audit payloads must stay readable; redaction must not eat normal content."""
     text = "Task created for user u-123 with title 'Quarterly report' at 2026-01-01T00:00:00Z"
     assert redact_text(text) == text
+
+
+# --- after the second audit: the evidence the redactor was destroying ---------
+
+
+def test_a_git_sha_survives_redaction():
+    """40 hex is a commit id. The 32-64 range ate every one of them."""
+    sha = "5fac9b1e7d3c2a4b6f8e0d1c3b5a7f9e2d4c6b8a"
+
+    assert sha in redact_text(f"commit {sha} done")
+
+
+def test_an_author_is_not_a_credential():
+    """`auth` as a substring marker masked every GitHub author in an audit payload."""
+    assert sanitize_payload({"author": "octocat"}) == {"author": "octocat"}
+    assert sanitize_payload({"auth_token": "abc123"}) == {"auth_token": MASK}
+    assert is_sensitive_key("sessionCount") is False
+    assert is_sensitive_key("sessionId") is True
+
+
+def test_a_payment_card_is_masked_and_a_plain_number_is_not():
+    """Luhn is the difference between a card and a 16-digit order id."""
+    assert "4111 1111 1111 1111" not in redact_text("card 4111 1111 1111 1111")
+    assert "1234567890123456" in redact_text("order 1234567890123456")
+
+
+def test_shapes_the_first_pass_did_not_know_are_recognised():
+    for text, marker in [
+        ("ssn 123-45-6789", "123-45-6789"),
+        ("iban DE89370400440532013000", "DE89370400440532013000"),
+        ("key sk_" + "live_51H8xQ2eZvKYlo2Cabcdefgh", "51H8xQ2eZvKYlo2Cabcdefgh"),
+        ("token hf_" + "abcdefghijklmnopqrstuvwxyz", "abcdefghijklmnopqrstuvwxyz"),
+    ]:
+        assert marker not in redact_text(text), text

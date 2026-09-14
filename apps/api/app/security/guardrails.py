@@ -30,6 +30,7 @@ boundary, and these checks are defence in depth on the *text* of an answer.
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
@@ -257,10 +258,21 @@ _NEGATION_MARKERS = (
 _NEGATION_WINDOW = 12
 _CLAIM_NEGATION_WINDOW = 24
 
+# A negator governs its own clause and no further.
+#
+# Looking back across punctuation is how a fabricated completion passed the
+# capability check: in "本政策只说明一件事：您的退款已经完成。" a stray 只 twelve
+# characters earlier counted as the negator, so the claim was read as a denial and
+# allowed. Commas end the lookback for the same reason.
+_CLAUSE_BOUNDARY_CHARS = "。！？；：，,;:!?\n"
+
 
 def _is_negated(text: str, start: int, *, window: int = _NEGATION_WINDOW) -> bool:
-    """Whether the phrase beginning at ``start`` is negated nearby."""
+    """Whether the phrase beginning at ``start`` is negated nearby, in its clause."""
     preceding = text[max(0, start - window) : start].lower()
+    boundary = max(preceding.rfind(char) for char in _CLAUSE_BOUNDARY_CHARS)
+    if boundary >= 0:
+        preceding = preceding[boundary + 1 :]
     return any(marker in preceding for marker in _NEGATION_MARKERS)
 
 
@@ -370,6 +382,26 @@ def _worst(findings: list[Finding]) -> Verdict:
 # input guardrail
 # ---------------------------------------------------------------------------
 
+# Invisible characters a pattern cannot see and a reader cannot either. Stripped
+# before matching, because "忽\u200b略" and "忽 略" are the same instruction to a
+# model and different strings to a regular expression.
+_ZERO_WIDTH = dict.fromkeys(map(ord, "\u200b\u200c\u200d\u2060\ufeff"), None)
+
+
+def normalise_for_matching(text: str) -> str:
+    """Fold the spellings a model reads as one instruction into one string.
+
+    Three evasions measured against the shipped patterns were all spelling:
+    full-width Latin (``Ｉｇｎｏｒｅ``), zero-width characters inside a keyword, and a
+    newline or space inserted between a verb and its object. NFKC folds the first,
+    stripping zero-width characters handles the second, and collapsing whitespace
+    handles the third. It is normalisation, not understanding -- a paraphrase still
+    has to be caught by a pattern.
+    """
+    folded = unicodedata.normalize("NFKC", text or "")
+    stripped = folded.translate(_ZERO_WIDTH)
+    return re.sub(r"\s+", " ", stripped).strip()
+
 
 def check_input(text: str) -> GuardrailResult:
     """Screen text for injection attempts.
@@ -384,10 +416,11 @@ def check_input(text: str) -> GuardrailResult:
     if not text or not text.strip():
         return GuardrailResult(verdict="allow", checks=[{"rule": "input_nonempty", "passed": True}])
 
+    screened = normalise_for_matching(text)
     rules = _compiled()["injection_patterns"]
     for rule in rules:
         for pattern in rule["patterns"]:
-            match = pattern.search(text)
+            match = pattern.search(screened)
             if match:
                 findings.append(
                     Finding(

@@ -72,13 +72,17 @@ CREDENTIAL_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
         "dsn",
         re.compile(r"\b([a-z][a-z0-9+.\-]*://)[^\s:/@]+:[^\s:/@]+@", re.IGNORECASE),
     ),
-    # Long opaque hex blobs (Azure keys, generic 32/40/64-hex secrets). Requires
-    # a non-alphanumeric boundary so it does not chew through ordinary ids; a
-    # 32+ char hex run in an audit payload is far more likely a key than data.
+    # Long opaque hex blobs (Azure-style keys, SHA-256 digests). 32 and 64 only:
+    # 40 hex is a git SHA-1, and a redactor that eats every commit id in an audit
+    # payload destroys evidence to protect nothing. A 40-character secret has to be
+    # caught by its key name instead, which is stated in the README limitations.
     (
         "hex_secret",
-        re.compile(r"(?<![0-9A-Za-z])(?:[0-9a-f]{32,64})(?![0-9A-Za-z])", re.IGNORECASE),
+        re.compile(r"(?<![0-9A-Za-z])(?:[0-9a-f]{32}|[0-9a-f]{64})(?![0-9A-Za-z])", re.IGNORECASE),
     ),
+    # Stripe and Hugging Face keys, both measured leaking before this.
+    ("stripe_key", re.compile(r"\bsk_(?:live|test)_[A-Za-z0-9]{16,}\b")),
+    ("huggingface_token", re.compile(r"\bhf_[A-Za-z0-9]{20,}\b")),
 )
 
 # --- PII shapes --------------------------------------------------------------
@@ -96,6 +100,12 @@ PII_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     # Landline with area code.
     ("cn_landline", re.compile(r"(?<!\d)0\d{2,3}[-\s]?\d{7,8}(?!\d)")),
     ("email", re.compile(r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b")),
+    # Payment cards, spaces or dashes allowed between groups. Validated with Luhn
+    # before masking: a 16-digit order id is not a card, and masking one would be the
+    # same evidence-destroying mistake as the hex range above.
+    ("payment_card", re.compile(r"(?<!\d)(?:\d[ -]?){12,18}\d(?!\d)")),
+    ("us_ssn", re.compile(r"(?<!\d)\d{3}-\d{2}-\d{4}(?!\d)")),
+    ("iban", re.compile(r"\b[A-Z]{2}\d{2}[A-Z0-9]{11,30}\b")),
 )
 
 ALL_PATTERNS = CREDENTIAL_PATTERNS + PII_PATTERNS
@@ -111,17 +121,15 @@ _SENSITIVE_KEY_MARKERS: tuple[str, ...] = (
     "password",
     "passwd",
     "authorization",
-    "auth",
     "cookie",
     "credential",
     "privatekey",
     "accesskey",
     "sessionkey",
     # `session` covers session_id / sessionId / sessionToken -- and, because matching
-    # is by substring, `sessionCount` as well. An earlier comment here claimed the
-    # opposite; `_KEY_ALLOWLIST` below is what actually excludes the metric-shaped
-    # names we know about. The lesson is that a broad marker list needs its
-    # false-positive cases written down and tested, not asserted in a comment.
+    # is by substring, `sessionCount` as well, which `_KEY_ALLOWLIST` below is what
+    # actually excludes. A broad marker list needs its false-positive cases written
+    # down and tested, not asserted in a comment.
     "session",
     "dsn",
     "bearer",
@@ -136,6 +144,14 @@ _SENSITIVE_KEY_MARKERS: tuple[str, ...] = (
     "contact",
 )
 
+# Markers that must match a whole separator-delimited part of the key.
+#
+# "auth" is the reason this list exists. As a substring marker it matched `author`,
+# so every GitHub author in an audit payload was masked as a secret -- a redactor
+# that destroys the evidence it is supposed to protect. `authorization` is still
+# caught by the substring list above, and `auth_token` matches here.
+_KEY_WORD_MARKERS: tuple[str, ...] = ("auth",)
+
 # Canonical spellings that must NOT be treated as sensitive even though they
 # contain a marker. Kept explicit so the list above can stay broad.
 _KEY_ALLOWLIST: frozenset[str] = frozenset(
@@ -145,6 +161,8 @@ _KEY_ALLOWLIST: frozenset[str] = frozenset(
         "tokenizer",
         "secretscannerfindings",
         "passwordpolicy",
+        "sessioncount",
+        "sessioncounts",
     }
 )
 
@@ -161,7 +179,10 @@ def is_sensitive_key(key: str) -> bool:
         return False
     if normalised.endswith("mailbox"):  # not a person's email
         return False
-    return any(marker in normalised for marker in _SENSITIVE_KEY_MARKERS)
+    if any(marker in normalised for marker in _SENSITIVE_KEY_MARKERS):
+        return True
+    parts = [part.lower() for part in _SEPARATOR_RE.split(key.strip()) if part]
+    return any(part in _KEY_WORD_MARKERS for part in parts)
 
 
 def mask_credential(value: str) -> str:
@@ -185,13 +206,39 @@ def mask_credential(value: str) -> str:
     return MASK
 
 
+def _luhn_ok(digits: str) -> bool:
+    """The checksum every payment card satisfies and most other numbers do not."""
+    if not digits.isdigit() or not 13 <= len(digits) <= 19:
+        return False
+    total = 0
+    for index, char in enumerate(reversed(digits)):
+        value = int(char)
+        if index % 2 == 1:
+            value *= 2
+            if value > 9:
+                value -= 9
+        total += value
+    return total % 10 == 0
+
+
+def _replacer(name: str):
+    """A substitution function for one shape, with its own validation."""
+
+    def replace(match: re.Match[str]) -> str:
+        if name == "payment_card" and not _luhn_ok(re.sub(r"\D", "", match.group(0))):
+            return match.group(0)
+        return _mask_match(match)
+
+    return replace
+
+
 def redact_text(text: str) -> str:
     """Redact every recognised secret/PII shape inside arbitrary text."""
     if not text:
         return text
     result = text
-    for _name, pattern in ALL_PATTERNS:
-        result = pattern.sub(_mask_match, result)
+    for name, pattern in ALL_PATTERNS:
+        result = pattern.sub(_replacer(name), result)
     return result
 
 

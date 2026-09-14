@@ -247,3 +247,25 @@ def test_every_policy_referenced_evidence_id_resolves(knowledge_root):
     # Every id the tool can return is a real chunk, and ids are namespaced by
     # document so they cannot collide across files.
     assert all("#" in chunk_id for chunk_id in chunk_ids)
+
+
+def test_a_two_character_query_retrieves_from_the_shipped_corpus():
+    """A word, not a sentence: 退款 yields one bigram and the floor was two terms.
+
+    The corpus is about refunds, so a query the corpus is made of returning nothing
+    was a defect rather than honesty.
+    """
+    from app.core.paths import KNOWLEDGE_DIR
+
+    source = build_knowledge_source(KNOWLEDGE_DIR)
+    result = source.execute("search_knowledge_base", {"query": "退款"})
+
+    assert result["citations"], "a corpus about refunds must be able to answer 退款"
+    assert all(citation["matched_terms"] >= 1 for citation in result["citations"])
+
+
+def test_an_unrelated_query_still_returns_nothing():
+    from app.core.paths import KNOWLEDGE_DIR
+
+    source = build_knowledge_source(KNOWLEDGE_DIR)
+    assert source.execute("search_knowledge_base", {"query": "今天天气怎么样"})["citations"] == []
