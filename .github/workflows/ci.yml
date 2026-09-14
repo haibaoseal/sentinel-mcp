@@ -48,30 +48,58 @@ jobs:
       - name: Verify governance guarantees
         run: python scripts/verify_p0_fixes.py
 
-  # Guards the property that makes this project worth reading: no module outside
-  # the designated execution boundary may execute a tool. Adding a new transport
-  # must not create a second, ungoverned path.
+  # Guards the property that makes this project worth reading: tool execution has
+  # exactly one authorised path. Adding a transport (MCP over stdio or HTTP) must
+  # not create a second, ungoverned route to a tool.
   boundary:
     name: execution boundary
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: No tool execution outside the firewall
+      - name: Registry is reached only from the firewall
         shell: bash
         run: |
           set -euo pipefail
-          # Sources may describe and run tools. Everything else must route
-          # through Firewall.execute().
-          violations=$(grep -rn --include='*.py' -E '\.execute\(' apps/api/app \
-            | grep -v 'apps/api/app/tools/sources/' \
-            | grep -v 'apps/api/app/governance/firewall.py' \
-            | grep -v 'apps/api/app/tests/' \
-            | grep -v 'ToolSource' \
+          # Only governance/firewall.py may call ToolRegistry.execute. Anything
+          # else reaching the registry directly would skip policy and audit.
+          violations=$(grep -rn --include='*.py' -E 'registry\.execute\(' apps/api/app \
+            | grep -v '^apps/api/app/governance/firewall.py:' \
             || true)
           if [ -n "$violations" ]; then
-            echo "Tool execution found outside the governed path:"
+            echo "::error::A module reached the tool registry outside the firewall:"
             echo "$violations"
             exit 1
           fi
-          echo "Execution boundary intact."
+          echo "Registry access is confined to the firewall."
+
+      - name: Tool sources are reached only from the registry
+        shell: bash
+        run: |
+          set -euo pipefail
+          # source.execute(...) belongs to the registry. A caller executing a
+          # source directly bypasses the registry's collision and provenance
+          # checks as well as the firewall.
+          violations=$(grep -rn --include='*.py' -E '\bsource\.execute\(' apps/api/app \
+            | grep -v '^apps/api/app/tools/registry.py:' \
+            | grep -v '/tests/' \
+            || true)
+          if [ -n "$violations" ]; then
+            echo "::error::A module executed a tool source directly:"
+            echo "$violations"
+            exit 1
+          fi
+          echo "Tool sources are reached only through the registry."
+
+      - name: The firewall does not accept an optional session
+        shell: bash
+        run: |
+          set -euo pipefail
+          # An optional session parameter is how the archived implementation
+          # ended up with a path that executed tools while skipping every audit
+          # write. Keep it mandatory.
+          if grep -n -E 'session\s*:\s*Session\s*\|\s*None' apps/api/app/governance/firewall.py; then
+            echo "::error::Firewall accepts an optional session; execution must always be recorded."
+            exit 1
+          fi
+          echo "Firewall requires a session."

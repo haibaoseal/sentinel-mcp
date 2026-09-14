@@ -165,11 +165,17 @@ Stated plainly, because overclaiming safety is worse than having none:
 | 0 | Governance core: contracts, policy engine, audit chain, redaction, CI | **done** |
 | 1 | Provider-abstracted agent loop (real model when a key is present, deterministic replay otherwise) | **done** |
 | 2 | Real tools: sandboxed filesystem, BM25 knowledge retrieval, maintenance tools | **done** |
-| 3 | MCP gateway: client and server, stdio and Streamable HTTP transports | next |
+| 3 | MCP gateway: client and server, stdio and Streamable HTTP transports | in progress |
 | 4 | Per-id citation binding, contradiction-aware output guardrails, bilingual injection detection | planned |
 | 5 | Unified trace DTO, deterministic evaluation, regression gate that fails CI on a score drop | planned |
 | 6 | End-to-end tests, live smoke test, deployment | planned |
 | 7 | Positioning and interview narrative | planned |
+
+Note that Phase 4 and Phase 3 are partly independent, and Phase 4 fixes are
+already justified by measurement rather than speculation: the archived guardrail
+allowed "退款草案会直接完成退款" to pass while citing the very excerpt that
+contradicts it, and its injection detector did not catch the plain English
+phrase "Ignore all previous instructions".
 
 ## Repository layout
 
