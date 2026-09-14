@@ -12,15 +12,17 @@ by shape:
 - ``identity.is_live`` says which produced it. Any surface that shows a score must
   consult it before implying the number measures model quality. That is the single
   field that stops a fixture score being presented as a model result.
-- ``replayable`` carries the inputs needed to reproduce the run, so a trace is
-  evidence rather than a log.
+- The spans carry the policy decision, the tool outcome and the guardrail checks that
+  actually ran, so a trace is evidence rather than a log. The inputs needed to *rerun*
+  a scenario live in ``evals/scenarios.json``, not in the trace.
 
 Timing is deliberately **excluded** from evaluation
 --------------------------------------------------
-Spans carry no wall-clock duration. A fixture run must produce a byte-identical
-trace every time, and a duration makes that impossible -- the archived project had
-a test that "verified determinism" while its DTO contained timestamps, which meant
-the assertion could only ever compare fields that happened to be stable. Where
+Spans carry no wall-clock duration, and every span is ordered deterministically, so two
+runs of the same scenario produce byte-identical traces once the top-level ``run_id``
+(the task's uuid) is removed. A duration would make even that impossible -- the archived
+project had a test that "verified determinism" while its DTO contained timestamps, which
+meant the assertion could only ever compare fields that happened to be stable. Where
 latency matters it belongs in a separate operational metric, not in a value that an
 eval score depends on.
 """

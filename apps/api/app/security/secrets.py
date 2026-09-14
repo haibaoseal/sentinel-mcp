@@ -117,10 +117,11 @@ _SENSITIVE_KEY_MARKERS: tuple[str, ...] = (
     "privatekey",
     "accesskey",
     "sessionkey",
-    # `session` covers session_id / sessionId / sessionToken. Deliberately
-    # narrower than bare "session": combined with `auth` above it means
-    # `sessionId` is caught while `sessionCount` (a metric) is not, because
-    # "sessioncount" contains neither marker.
+    # `session` covers session_id / sessionId / sessionToken -- and, because matching
+    # is by substring, `sessionCount` as well. An earlier comment here claimed the
+    # opposite; `_KEY_ALLOWLIST` below is what actually excludes the metric-shaped
+    # names we know about. The lesson is that a broad marker list needs its
+    # false-positive cases written down and tested, not asserted in a comment.
     "session",
     "dsn",
     "bearer",

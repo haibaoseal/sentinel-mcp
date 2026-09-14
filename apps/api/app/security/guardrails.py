@@ -372,7 +372,14 @@ def _worst(findings: list[Finding]) -> Verdict:
 
 
 def check_input(text: str) -> GuardrailResult:
-    """Screen user or tool-supplied text for injection attempts."""
+    """Screen text for injection attempts.
+
+    The agent loop calls this on the *user request only* (``AgentLoop.run_traced``).
+    Tool output, retrieved knowledge chunks and remote tool descriptions reach the
+    model without passing through here -- a gap stated in the README's limitations,
+    not a property of this function. It previously claimed to screen "user or
+    tool-supplied" text, which nothing did.
+    """
     findings: list[Finding] = []
     if not text or not text.strip():
         return GuardrailResult(verdict="allow", checks=[{"rule": "input_nonempty", "passed": True}])

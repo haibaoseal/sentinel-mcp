@@ -9,13 +9,18 @@ internal one. So this tool:
 1. Requires the hostname to be on the allow-list before the request.
 2. Resolves the hostname and refuses private, loopback, link-local and reserved
    addresses -- the check that a name-based allow-list cannot make.
-3. **Pins the request to the verified address** via a custom transport, so the name
-   cannot resolve differently between the check and the connection (DNS rebinding).
+3. Rejects private, loopback, link-local and reserved answers *before* the request.
+   **This is a check-then-connect window, not a pin**: the checks are correct, but the
+   name is resolved a second time by the HTTP client, so a DNS answer that changes in
+   between can still reach an internal address. Pinning the connection to the verified
+   address needs a custom transport, which is not implemented -- an earlier version of
+   this docstring claimed it was.
 4. Follows no redirects at all. A redirect is a second request whose target policy
    never approved; refusing them is simpler than re-validating, and an agent that
    needs another URL can ask for it.
-5. Caps the response size and reads incrementally, so a hostile endpoint cannot
-   exhaust memory.
+5. Caps the response size. The body is buffered and then rejected if it exceeds the
+   cap, so a hostile endpoint can still make this process hold the whole payload
+   before the refusal; refusing it incrementally is a known improvement.
 
 Only GET. POST and anything else would be an external action, and those are a
 separate policy decision rather than a flag on this tool.

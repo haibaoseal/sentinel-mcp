@@ -1,12 +1,15 @@
 # sentinel-mcp
 
+[![CI](https://github.com/haibaoseal/sentinel-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/haibaoseal/sentinel-mcp/actions/workflows/ci.yml)
+[![Licence: MIT](https://img.shields.io/badge/licence-MIT-blue.svg)](LICENSE)
+
 **A governed Model Context Protocol gateway: policy, human approval, hash-chained audit and deterministic evaluation for tool-calling agents.**
 
 The premise of this project is that the hard part of shipping an agent is not making it call tools. It is controlling *which* tools it may call, proving *what* it did afterwards, and being able to say with evidence whether a change made it safer or less safe.
 
 `sentinel-mcp` sits between an agent and every tool it can reach — local Python functions and remote MCP servers alike — and makes each proposed call pass a policy decision, an optional human approval, and an append-only audit chain.
 
-> **Status: Phases 0–5 of a staged build.** The governance core, the provider-abstracted agent loop, the real tools, the MCP gateway (both directions), the guardrails, and the evaluation harness with a regression gate are implemented and tested. Remaining: live smoke test and final positioning. See [Roadmap](#roadmap).
+> **Status: Phases 0–8 of a staged build are complete** — the governance core, the provider-abstracted agent loop, the real tools, the MCP gateway (both directions), the guardrails, the deterministic evaluation harness with a regression gate, live-path verification against a vendor stub, and the **approval round trip**: a held call becomes a pending `ApprovalRequest`, a reviewer approves (optionally with edited arguments, which are re-evaluated), rejects, or leaves it, and an approved call executes through the same firewall. See [Approving a held call](#approving-a-held-call) and [Roadmap](#roadmap).
 
 ## Why this exists
 
@@ -18,7 +21,7 @@ Governance must not know **where** a tool lives.
 
 A tool may be a local Python object, a subprocess MCP server over stdio, or a remote MCP server over HTTP. All three are described by the same `ToolDescriptor` and served through the same `ToolSource` protocol, so all three are subject to the *same* policy decision, the *same* approval workflow and the *same* audit record.
 
-Earlier versions of this codebase called a registry directly, which quietly made "governed" a property of being registered in-process. Splitting *description* from *execution* is what allows an untrusted remote tool to be governed on equal terms — and it is why adding MCP support did not require touching the policy engine, the approval service or the audit log.
+Earlier versions of this codebase called a registry directly, which quietly made "governed" a property of being registered in-process. Splitting *description* from *execution* is what allows an untrusted remote tool to be governed on equal terms — and it is why adding MCP support did not require touching the policy engine, the approval decision or the audit log.
 
 ```text
 LLM agent ──► ToolRequest
@@ -30,7 +33,8 @@ LLM agent ──► ToolRequest
      allow ◄─────┼─────► block / require_approval
                  ▼
         ┌─────────────────┐
-        │ ApprovalService │  human review; modifications re-evaluated
+        │ ApprovalService │  records the hold; a reviewer approves (with edited
+        │                 │  arguments, re-evaluated), rejects, or leaves it
         └────────┬────────┘
                  ▼
         ┌─────────────────┐        ┌──────────────┐  ┌──────────────┐
@@ -41,6 +45,26 @@ LLM agent ──► ToolRequest
         │   AuditLogger   │  per-task hash chain, ordered by explicit seq
         └─────────────────┘
 ```
+
+A `require_approval` decision writes an `ApprovalRequest` and returns `waiting_approval`: the call is persisted, reported to the caller as held, and audited. It then leaves this flow until a reviewer decides. **A decision is checked, not trusted** — `Firewall.execute` accepts an `approval_id` and only relaxes the hold when that approval exists, still authorises execution, covers a proposal for the *same* tool, and matches the arguments being executed exactly. A `block` is never relaxed by an approval.
+
+## Approving a held call
+
+```bash
+# what is waiting for a human
+PYTHONPATH=apps/api python -m app.approvals.cli list
+
+# approve it as proposed, or edit the arguments first (the edit is re-evaluated)
+PYTHONPATH=apps/api python -m app.approvals.cli approve <approval-id> --reviewer alice
+PYTHONPATH=apps/api python -m app.approvals.cli approve <id> --reviewer alice \
+    --set order_id=ORD-2002
+
+# refuse it; nothing executes
+PYTHONPATH=apps/api python -m app.approvals.cli reject <id> --reviewer bob \
+    --comment "wrong customer"
+```
+
+Two rules decide whether an *edit* may proceed, and both exist so a reviewer cannot use an edit to reduce the controls the original proposal was subject to: an edit that policy now **blocks** is refused (a reviewer supplies the approval a `require_approval` rule asks for, but cannot edit past a `default_block`), and an edit that **raises the risk level** above what was shown is refused. A refused edit executes nothing, stays visible on the chain as `approval.modification_refused`, and leaves the request `pending` so the reviewer can try a different change.
 
 ## Safety posture
 
@@ -61,7 +85,7 @@ python -m venv .venv
 # POSIX:   source .venv/bin/activate
 python -m pip install -e ".[dev]"
 
-python -m pytest apps/api/app/tests   # 293 tests
+python -m pytest apps/api/app/tests   # 401 collected; one symlink test skips on Windows
 python -m ruff check apps/api/app mcp_servers scripts
 python -m ruff format --check apps/api/app mcp_servers scripts
 ```
@@ -105,7 +129,7 @@ Two of these design points are worth stating plainly, because both were mistakes
 - **The inert tools are registered on purpose.** A policy rule for a tool that does not exist proves nothing: "it did not run" is true for the wrong reason. The archived project had exactly that — a `delete_file` rule and a scenario asserting deletion was blocked, with no such tool. Now every "blocked" assertion has a reachable tool behind it, and the scenario contract check enforces this: a scenario naming an unregistered tool stops the suite.
 - **The SQL guarantee does not depend on the query string.** The policy engine also rejects non-SELECT statements, but that is a decision made by matching text a caller controls. `mode=ro` plus `PRAGMA query_only` means the connection physically cannot write, which is the layer that still holds if the pattern is wrong.
 
-`demo_agent.py` runs the whole stack — provider, loop, policy, approval, audit — and prints:
+`demo_agent.py` runs the whole stack — provider, loop, policy, the approval hold, audit — and prints:
 
 | Request | Outcome |
 |---|---|
@@ -261,7 +285,7 @@ The scenarios and the verified metrics live in version control (`evals/scenarios
 **Two kinds of regression are caught, and the second is the easy one to miss.**
 
 1. **Rate drop** — fewer of the checks that ran passed.
-2. **Evidence shrink** — the *number* of checks fell while the rate stayed at `1.0`. Deleting or weakening assertions removes checks, and 3-of-3 and 8-of-8 both report `1.0`. A rate-only gate certifies a hollowed-out suite, so the count is gated as well. Both are verified by deliberately breaking the baseline and confirming exit code 2.
+2. **Evidence shrink** — the *number* of checks fell while the rate stayed at `1.0`. Deleting or weakening assertions removes checks, and 3-of-3 and 8-of-8 both report `1.0`. A rate-only gate certifies a hollowed-out suite, so the count is gated as well. Both were verified by hand during development — breaking the baseline deliberately and observing exit code 2. The CLI's four exit codes do **not** yet have an automated test; that is a gap, not coverage.
 
 Metrics report their own denominators, and a metric with no checks is reported as **absent** rather than as a perfect score — the archived suite returned `1.0` for an empty metric set, so a metric that measured nothing printed as 100%.
 
@@ -269,7 +293,7 @@ The report states in its own text what kind of measurement it is. A stored artif
 
 ### Timing is excluded from evaluation on purpose
 
-Spans carry no wall-clock duration. A fixture run must produce a byte-identical trace every time, and a duration makes that impossible. The archived project had a test that "verified determinism" while its DTO contained timestamps, so the assertion could only ever compare fields that happened to be stable. Latency belongs in an operational metric, not in a value an eval score depends on.
+Spans carry no wall-clock duration. A fixture run must produce a byte-identical trace every time, and a duration makes that impossible. The one exception is the trace-level `run_id`, which is the task's uuid: removing that single field makes two runs of the same scenario byte-identical, and every score is identical either way. The archived project had a test that "verified determinism" while its DTO contained timestamps, so the assertion could only ever compare fields that happened to be stable. Latency belongs in an operational metric, not in a value an eval score depends on.
 
 ## What is verified, and how
 
@@ -280,13 +304,19 @@ This project's central claim is that its safety properties are measured rather t
 | An honest audit chain verifies even when all events share a timestamp | `test_audit_chain.py::test_chain_verifies_when_every_event_shares_one_timestamp` |
 | Payload tampering is detected at the exact sequence number | `test_audit_chain.py::test_tampering_with_a_payload_is_detected` |
 | Deleting a middle event is detected | `test_audit_chain.py::test_deleting_a_middle_event_is_detected` |
-| Secrets and Chinese PII are redacted (15 credential shapes, 7 PII shapes) | `test_redaction.py` — asserts the **absence** of a discriminating substring |
+| Secrets and Chinese PII are redacted (11 credential shapes, 5 PII shapes — the 15 and 7 in `test_redaction.py` count *cases*, not shapes) | `test_redaction.py` — asserts the **absence** of a discriminating substring |
 | Unknown tools, unknown actions and destructive tools fail closed | `test_policy_engine.py` |
 | Read-only SQL cannot be escaped by stacked statements or comments | `test_policy_engine.py` |
 | A failed tool call is never answered with the model's success claim | `test_agent_loop.py::test_failed_run_is_not_reported_as_success` |
 | A repeated identical call stops the loop instead of burning turns | `test_agent_loop.py::test_identical_repeated_call_is_detected_before_the_turn_limit` |
 | Every executed call has a matching audit record and a verifying chain | `test_agent_loop.py::test_every_executed_call_has_an_audit_record` |
-| Path traversal, absolute paths and symlink escape are refused | `test_filesystem_sandbox.py` |
+| A held call becomes a **pending approval**, not just a status string | `test_approvals.py::test_a_held_call_creates_a_pending_approval` |
+| Approving a held call executes it through the firewall and audits both steps | `test_approvals.py::test_approved_call_executes_through_the_firewall` |
+| An edited argument set is re-evaluated; an escalation is refused and nothing runs | `test_approvals.py::test_a_modification_that_escalates_risk_is_refused` |
+| A reviewer's edit cannot talk policy out of a `block` | `test_approvals.py::test_an_edit_cannot_talk_policy_out_of_a_block` |
+| An approval cannot be replayed, and is not transferable to another call | `test_approvals.py::test_an_approval_cannot_be_replayed` / `::test_an_approval_is_not_a_transferable_token` |
+| A `default_block` rule is not relaxed by an approval | `test_approvals.py::test_a_block_rule_is_not_relaxed_by_an_approval` |
+| Path traversal and absolute paths are refused by every filesystem tool; symlink escape is refused by `fs_read` and `fs_list` | `test_filesystem_sandbox.py` — note `fs_search` does **not** re-check each file it walks; see [Honest limitations](#honest-limitations) |
 | Citation line ranges point at the cited content | `test_knowledge_retrieval.py::test_line_range_points_at_the_real_content` |
 | An unrelated question returns no citations instead of weak matches | `test_knowledge_retrieval.py::test_unrelated_query_returns_nothing` |
 | An unmapped remote MCP tool is held for approval, not trusted | `test_mcp_gateway.py::test_unmapped_remote_tool_defaults_to_unknown_action` |
@@ -325,6 +355,25 @@ Stated plainly, because overclaiming safety is worse than having none:
 - **The live path is verified against a stub, not a vendor.** `mock_llm_stub.py` speaks the same protocol and misbehaves the way a model does, which is enough to pin request encoding, response decoding and the governance interaction. It is not evidence that a specific vendor accepts the requests; only a run against that vendor is, and that needs a credential.
 - **MCP tool trust is a mapping, not a sandbox.** A remote tool the operator maps to `read` runs unattended. The mapping is an explicit, reviewable act, and unmapped tools are held — but a server the operator deliberately trusts can still return whatever it likes, and nothing here validates a remote tool's *output*.
 - **The guardrails are pattern-based, not entailment.** They catch contradictions in a bounded, named, testable way by comparing content terms against a threshold. They are not a fact-checker.
+- **An approved call executes out of band from the caller that proposed it.** A held agent run reports `waiting_approval` and ends; approving it later executes the call under the reviewer's identity and records the result on the chain, but the original run is not resumed, so its final answer still says the action was held. Resuming the run is a separate piece of work.
+- **Approval expiry is not implemented.** The model lists an `expired` status; a pending request stays pending until someone decides. There is also no notification when a request is created.
+- **The audit chain cannot detect truncation of its own tail.** `verify_chain` requires `seq` to be gap-free from 1, so deleting the *most recent* events leaves a chain that still verifies — measured, not assumed (`test_unkeyed_chain_is_rewritable_from_genesis` covers the stronger attack of rewriting from genesis). Only an external anchor closes this: a published head, or a key held outside the database.
+- **Input screening covers the user request only.** `check_input` has exactly one caller, on `run.user_request`. Text returned by a tool, retrieved from the knowledge base, or supplied as a remote tool's `description` reaches the model unscreened. The function's docstring claimed it screened tool-supplied text; it does not, because nothing calls it there.
+- **`fs_search` does not re-check containment per file.** It validates the starting directory and then walks it, so a directory junction inside the sandbox (`mklink /J`, which needs no privilege on Windows) is followed and its contents are returned — while `fs_read` and `fs_list` refuse the same path. Measured.
+- **Redaction damages as well as protects.** `hex_secret` masks any 32–64 character hex run, so commit SHAs and digests are destroyed; the `auth` key marker matches `author`, so a GitHub author in an audit payload becomes `********`. Card numbers, SSNs, IBANs and `sk_live_`/`hf_`-style keys are not recognised at all.
+- **The capability check is a proximity heuristic and fails in both directions.** A negation word anywhere in the preceding 24 characters disarms it — including a stray 只 — so a fabricated completion can pass; and a negator sitting exactly at the match boundary can make an honest denial look like a claim. Measured; the fix is clause-scoped polarity, not a longer word list.
+- **`http_get` validates an address and then connects by name.** The module docstring claimed the request was pinned to the verified address via a custom transport; there is no such transport, so a DNS answer that changes between the check and the connection reaches an internal address. The response body is also buffered before its size is checked.
+- **The evaluation gate protects 47 of the suite's 87 checks, and the baseline can be rewritten.** `must_propose`, `must_execute`, `status`, `termination` and the answer-content checks belong to no gated metric; 24 of the 27 `must_not_execute` checks name a tool the scripted provider never proposed; and `--update-baseline` re-anchors whatever it observes. The scenario contract check rejects a scenario with no expectations, but not a misspelled expectation key.
+- **Retrieval needs at least two matched terms**, so a two-character CJK query returns nothing — including 退款, on this repository's own corpus.
+
+## Archived predecessors
+
+This repository is the maintained successor to two prototypes. Both are kept online, because the defects they contain are the reason this codebase is organised the way it is:
+
+- [`haibaoseal/agent-sentinel`](https://github.com/haibaoseal/agent-sentinel) — the safety runtime: firewall, policy engine and approval service. Its audit chain ordered writes and verification differently (so honest chains failed verification), and its redactor leaked the tail of `Bearer abc+/def==` while looking redacted.
+- [`haibaoseal/agent-qa-lab`](https://github.com/haibaoseal/agent-qa-lab) — the evaluation workbench: scenarios, metrics, and a v1/v2 comparison whose entire delta was derivable from two booleans.
+
+Each carries an `ARCHIVED.md` naming what it got wrong and how this repository answers it. Neither is needed to build or run this one.
 
 ## Roadmap
 
@@ -338,6 +387,8 @@ Stated plainly, because overclaiming safety is worse than having none:
 | 5 | Unified trace model, deterministic evaluation, regression gate | **done** |
 | 6 | Live-path verification against a local vendor stub, plus provider wire-format tests | **done** |
 | 7 | Positioning, archived-repository pointers | **done** |
+| 8 | Approval service: approve / reject, modified-argument re-evaluation, and the approval queue the outbound gateway tells clients about | **done** |
+| 9 | Resuming the agent run after an approval, approval expiry, and reviewer notifications | **planned** |
 
 The live path is verified against a stub on every build. A run against a **real** vendor needs a credential, and is an optional CI job gated on an `LLM_API_KEY` secret; without it the check reports `SKIPPED`, never a pass.
 
