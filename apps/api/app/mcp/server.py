@@ -18,7 +18,13 @@ MCP tool calls expect a result. When policy returns ``require_approval`` there i
 nothing to return yet, so the handler answers with a structured "held" result and
 ``is_error=False``: it is not a failure, it is a governance outcome, and the
 external client must report it as such rather than as a successful action. The
-pending approval is recorded and visible in the approval queue.
+call is recorded as an ``ApprovalRequest`` -- the same queue
+``python -m app.approvals.cli`` reads -- so a reviewer can approve or reject it.
+
+What the client sees either way is a hold: a decision executes the call out of
+band under the reviewer's identity, so this client does not receive the result on
+the call it made. Reporting the hold as a success would be a lie; reporting it as
+a failure would invite a retry of a gated action.
 """
 
 from __future__ import annotations
@@ -167,9 +173,11 @@ class GovernedMCPServer:
             # "failed" would invite the client to retry a gated action.
             payload["held_for_approval"] = True
             payload["reason"] = (result.data or {}).get("risk_reasons") or []
+            payload["approval_id"] = (result.data or {}).get("approval_id")
             payload["note"] = (
                 "This action requires human approval and has NOT been executed. "
-                "It is visible in the approval queue."
+                "It is queued as a pending approval; a reviewer's decision runs it "
+                "out of band, so this call will not return its result."
             )
         elif result.status == "blocked":
             payload["blocked_by_policy"] = True

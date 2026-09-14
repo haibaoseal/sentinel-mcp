@@ -62,6 +62,31 @@ class ApprovalNotFoundError(SentinelError):
     http_status = 404
 
 
+class ApprovalStateError(SentinelError):
+    """The approval is not in a state that authorises what was asked of it.
+
+    Rejecting twice, approving something already executed, or executing an
+    approval that is still ``pending`` all land here. It is a distinct code
+    because "a reviewer has not decided yet" and "this decision was already
+    spent" call for different actions from a caller.
+    """
+
+    code = "APPROVAL_STATE"
+    http_status = 409
+
+
+class ApprovalMismatchError(SentinelError):
+    """An approval was presented for a call it does not cover.
+
+    Raised when the tool or the arguments being executed differ from the ones the
+    reviewer approved. Without this check, an approval would be a transferable
+    token: approve a harmless refund draft, then run anything.
+    """
+
+    code = "APPROVAL_MISMATCH"
+    http_status = 409
+
+
 class TaskNotFoundError(SentinelError):
     code = "TASK_NOT_FOUND"
     http_status = 404

@@ -180,6 +180,79 @@ check(
     _detects_evidence_shrink(),
 )
 
+# --- (5b) the approval round trip -------------------------------------------
+from app.approvals.service import ApprovalService  # noqa: E402
+from app.core.contracts import ToolRequest  # noqa: E402
+from app.db.models import AgentTask, ApprovalRequest, Base  # noqa: E402
+from app.governance.firewall import Firewall  # noqa: E402
+from app.policy.engine import PolicyEngine  # noqa: E402
+from app.tools.registry import ToolRegistry  # noqa: E402
+from app.tools.sources.local import LocalTool, LocalToolSource  # noqa: E402
+from sqlalchemy import create_engine, select  # noqa: E402
+from sqlalchemy.orm import Session  # noqa: E402
+
+check(
+    "the approval service has an approve path and a reject path",
+    callable(getattr(ApprovalService, "approve", None))
+    and callable(getattr(ApprovalService, "reject", None)),
+)
+
+
+def _approval_round_trip_works() -> bool:
+    """A held call must become a decidable row, and approving it must execute once."""
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    executed: list[dict] = []
+
+    def refund(arguments: dict) -> dict:
+        executed.append(dict(arguments))
+        return {"ok": True}
+
+    source = LocalToolSource(
+        [
+            LocalTool(
+                name="draft_refund",
+                run=refund,
+                action_type="financial",
+                resource_type="order",
+                risk_level="high",
+                requires_approval=True,
+            )
+        ],
+        name="verify",
+    )
+    firewall = Firewall(registry=ToolRegistry([source]), policy_engine=PolicyEngine())
+    with Session(engine, expire_on_commit=False) as session:
+        task = AgentTask(title="approval check", user_request="refund", status="running")
+        session.add(task)
+        session.flush()
+        held = firewall.execute(
+            ToolRequest(
+                task_id=task.id,
+                tool_name="draft_refund",
+                action_type="financial",
+                arguments={"order_id": "ORD-1"},
+            ),
+            session=session,
+        )
+        if held.status != "waiting_approval" or executed:
+            return False
+        pending = session.scalars(
+            select(ApprovalRequest).where(ApprovalRequest.status == "pending")
+        ).all()
+        if len(pending) != 1:
+            return False
+        outcome = ApprovalService(firewall=firewall, session=session).approve(
+            pending[0].id, reviewer_id="verify"
+        )
+        return outcome.executed and len(executed) == 1
+
+
+check(
+    "a held call becomes a pending approval, and approving it executes it exactly once",
+    _approval_round_trip_works(),
+)
+
 # --- (6) CI, locked dependencies, live smoke --------------------------------
 ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
 check("CI runs the test suite", "pytest" in ci)
@@ -197,10 +270,24 @@ check(
 readme = (ROOT / "README.md").read_text(encoding="utf-8")
 check("the README positions the project as infrastructure", "MCP gateway" in readme)
 check("the README states its limitations", "## Honest limitations" in readme)
+# The two archived prototypes live beside this repository in the author's
+# workspace, but not in a clone -- so the sibling check only applies when they are
+# present, and the clone-safe half is that the README links them by URL.
+ARCHIVED = {
+    "xiangmu1": "https://github.com/haibaoseal/agent-sentinel",
+    "xiangmu2": "https://github.com/haibaoseal/agent-qa-lab",
+}
+siblings = {name: ROOT.parent / name / "ARCHIVED.md" for name in ARCHIVED}
+present = {name: path for name, path in siblings.items() if path.parent.is_dir()}
 check(
-    "both archived repositories point here",
-    (ROOT.parent / "xiangmu1" / "ARCHIVED.md").exists()
-    and (ROOT.parent / "xiangmu2" / "ARCHIVED.md").exists(),
+    "the archived repositories, where present locally, point here",
+    all(path.is_file() for path in present.values()),
+    f"checked {len(present)} of {len(siblings)} siblings",
+)
+check(
+    "the README links both archived repositories",
+    all(url in readme for url in ARCHIVED.values()),
+    "otherwise the predecessors are unreachable from a clone",
 )
 check(
     "the firewall requires a session (no ungoverned path)",
