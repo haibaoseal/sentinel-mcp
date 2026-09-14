@@ -21,6 +21,11 @@ from sqlalchemy.orm import Session  # noqa: E402
 engine = create_engine("sqlite+pysqlite:///:memory:")
 Base.metadata.create_all(engine)
 
+# Collected as we go, then turned into an exit code. An earlier version of this
+# script only *printed* its findings, so CI's "Verify governance guarantees" step
+# passed with redaction fully broken -- a demonstration standing in for a gate.
+failures: list[str] = []
+
 print("=" * 74)
 print("P0-1  Audit chain: N events sharing one timestamp")
 print("=" * 74)
@@ -51,6 +56,11 @@ with Session(engine) as s:
         f"  after tampering   : ok={bad.ok} first_bad_seq={bad.first_bad_seq} reason={bad.reason!r}"
     )
 
+    if not verdict.ok:
+        failures.append("an honest chain of same-timestamp events did not verify")
+    if bad.ok:
+        failures.append("payload tampering was not detected")
+
 print()
 print("=" * 74)
 print("P0-2  Redaction: shapes the archived implementation leaked")
@@ -72,6 +82,8 @@ cases = [
 for label, secret in cases:
     out = redact_text(f"payload {secret} end")
     leaked = secret in out
+    if leaked:
+        failures.append(f"redaction leaked {label}")
     mark = "LEAK" if leaked else "ok  "
     print(f"  [{mark}] {label:20} -> {out}")
 
@@ -81,3 +93,13 @@ print("Note: 'Bearer abc+/def==' previously became '[REDACTED]+/def==' -- it")
 print("looked redacted while leaking the tail. That class of bug is why the")
 print("redaction tests assert the ABSENCE of a substring, not a marker.")
 print("=" * 74)
+
+if failures:
+    print()
+    print(f"FAILED ({len(failures)}):")
+    for failure in failures:
+        print(f"  - {failure}")
+    # Exit non-zero so CI's "Verify governance guarantees" step is a gate rather
+    # than a demonstration that always passes.
+    raise SystemExit(1)
+print("\nOK: the chain self-verifies, tampering is detected, and no listed shape leaked.")
