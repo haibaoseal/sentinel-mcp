@@ -197,6 +197,9 @@ def test_a_payment_card_is_masked_and_a_plain_number_is_not():
 
 
 def test_shapes_the_first_pass_did_not_know_are_recognised():
+    # The Stripe and Hugging Face fixtures are assembled from parts, for the same
+    # reason as the Slack one above: a literal in credential shape is refused by
+    # GitHub push protection, and a test fixture is not worth an allow-list entry.
     for text, marker in [
         ("ssn 123-45-6789", "123-45-6789"),
         ("iban DE89370400440532013000", "DE89370400440532013000"),
