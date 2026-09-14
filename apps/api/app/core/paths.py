@@ -24,19 +24,34 @@ SCENARIOS_FILE = EVALS_DIR / "scenarios.json"
 BASELINE_FILE = EVALS_DIR / "baseline.json"
 
 
+def is_accidentally_absolute(path: Path) -> bool:
+    """Whether an absolute path is a bare root such as ``/sandbox``.
+
+    A single-component rooted path is what a config author usually means as
+    repository-relative: on Windows ``/sandbox`` reads as ``C:\\sandbox``, which
+    nobody intends, and the module docstring's examples are exactly this shape.
+    Anything deeper is honoured as written. Reading ``/tmp/pytest-0/knowledge`` as
+    ``<repo>/tmp/pytest-0/knowledge`` is how a knowledge root silently disappeared
+    -- the knowledge source was never registered and every policy question came back
+    with "no actionable steps", which is the failure this module exists to prevent.
+    """
+    if path.drive or not path.root:
+        return False
+    return len([part for part in path.parts if part not in ("/", "\\")]) == 1
+
+
 def resolve_config_path(value: str) -> Path:
     """Resolve a configured path against the repository root.
 
-    Absolute paths are honoured. A path that is only *accidentally* absolute --
-    ``/sandbox`` or ``\\\\sandbox`` -- is treated as repository-relative, because that
-    is what a config author almost certainly meant and silently reading ``C:\\\\sandbox``
-    would be a confusing way to fail.
+    An absolute path is honoured unless it is a bare root (see
+    ``is_accidentally_absolute``), in which case it is read as repository-relative.
+    A relative path is always repository-relative, which is what ``./sandbox`` in
+    ``.env.example`` means.
     """
     raw = value.strip()
     path = Path(raw).expanduser()
     if path.is_absolute():
-        drive, tail = path.drive, str(path)[len(path.drive) :]
-        if tail.startswith(("/", "\\")) and not drive:
-            return (REPO_ROOT / tail.lstrip("/\\")).resolve()
+        if is_accidentally_absolute(path):
+            return (REPO_ROOT / str(path).lstrip("/\\")).resolve()
         return path.resolve()
     return (REPO_ROOT / path).resolve()

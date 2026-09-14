@@ -98,6 +98,18 @@ def build_sql_source(database: Path) -> LocalToolSource:
             raise ToolArgumentError("row_limit must be an integer") from exc
         row_limit = max(1, min(row_limit, MAX_ROWS))
 
+        # `mode=ro` protects *this* database. `ATTACH` opens a second one whose
+        # permissions are the filesystem's, and `VACUUM INTO` writes a file too, so
+        # both are refused here rather than left to the policy layer. This test
+        # reached the tool directly and passed on Windows only because `/tmp` did
+        # not exist there; CI on Linux showed an attached database being created.
+        first_word = query.lstrip("( \t\r\n").split(None, 1)[0].lower() if query.strip() else ""
+        if first_word in {"attach", "detach", "vacuum"}:
+            raise ToolExecutionError(
+                f"{first_word.upper()} is refused: a read-only connection protects the "
+                "database it opened, not one attached afterwards"
+            )
+
         try:
             # uri=True plus mode=ro is the structural guarantee: this connection
             # cannot perform a write even if the statement somehow got past the

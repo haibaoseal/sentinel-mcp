@@ -74,10 +74,19 @@ def test_writes_fail_at_the_connection(sql_source, query):
     assert check["rows"][0][0] == 5
 
 
-def test_attach_is_refused(sql_source):
-    """ATTACH would open a second, writable database -- a way around mode=ro."""
+def test_attach_is_refused(sql_source, tmp_path):
+    """ATTACH would open a second, writable database -- a way around mode=ro.
+
+    The target is a directory that really exists, so the refusal comes from the
+    tool rather than from the filesystem. Pointing at ``/tmp/evil.db`` made this
+    test pass on Windows for the wrong reason and fail on Linux, where an attached
+    database was created.
+    """
+    target = tmp_path / "evil.db"
     with pytest.raises((ToolExecutionError, ToolArgumentError)):
-        sql_source.execute("sql_query", {"query": "ATTACH DATABASE '/tmp/evil.db' AS evil"})
+        sql_source.execute("sql_query", {"query": f"ATTACH DATABASE '{target.as_posix()}' AS evil"})
+
+    assert not target.exists(), "the refusal must happen before a file is created"
 
 
 def test_row_limit_is_clamped(sql_source):

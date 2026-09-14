@@ -85,7 +85,7 @@ python -m venv .venv
 # POSIX:   source .venv/bin/activate
 python -m pip install -e ".[dev]"
 
-python -m pytest apps/api/app/tests   # 401 collected; one symlink test skips on Windows
+python -m pytest apps/api/app/tests   # 405 collected; one symlink test skips on Windows
 python -m ruff check apps/api/app mcp_servers scripts
 python -m ruff format --check apps/api/app mcp_servers scripts
 ```

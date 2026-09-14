@@ -64,7 +64,15 @@ def test_search_reports_file_and_line(source):
         "../../etc/passwd",
         "sub/../../outside.txt",
         "sub/../../../etc/passwd",
-        "..\\..\\outside.txt",
+        # A backslash separates path components only on Windows. On POSIX this is
+        # one filename that happens not to exist -- a different refusal, and the
+        # correct one -- so the case is asserted where it means something.
+        pytest.param(
+            "..\\..\\outside.txt",
+            marks=pytest.mark.skipif(
+                os.name != "nt", reason="backslash is not a path separator on POSIX"
+            ),
+        ),
     ],
 )
 def test_traversal_is_refused(source, path):
