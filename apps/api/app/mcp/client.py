@@ -73,6 +73,15 @@ class MCPServerSpec:
     enabled: bool = True
     startup_timeout: float = 45.0
     call_timeout: float = 60.0
+    # Whether the host's HTTP proxy configuration applies to this server.
+    #
+    # Default False, and the default matters. A proxy configured for internet
+    # traffic is frequently wrong for a local endpoint: on the machine this was
+    # built on, a system proxy at 127.0.0.1:7897 answered localhost MCP requests
+    # with 502 and an empty body while the MCP server logged nothing at all --
+    # which looks exactly like a broken server. Set True only when a *remote* MCP
+    # server genuinely has to be reached through a proxy.
+    use_system_proxy: bool = False
 
     def validate(self) -> None:
         if not self.name or not all(ch.isalnum() or ch in "-_" for ch in self.name):
@@ -234,7 +243,31 @@ class MCPClient:
             )
         from mcp.client.streamable_http import streamable_http_client
 
-        return streamable_http_client(self.spec.url)
+        return streamable_http_client(self.spec.url, http_client=self._http_client())
+
+    def _http_client(self):
+        """HTTP client for the Streamable HTTP transport.
+
+        Constructed explicitly rather than letting the SDK build one, because the
+        SDK default honours the host's proxy environment -- see the note on
+        ``MCPServerSpec.use_system_proxy`` for why that silently breaks local
+        endpoints.
+
+        ``trust_env`` is passed to the constructor because it is a read-only
+        property on the client once built.
+        """
+        from mcp.client.streamable_http import create_mcp_http_client
+
+        if self.spec.use_system_proxy:
+            return create_mcp_http_client(headers=dict(self.spec.headers) or None)
+
+        import httpx2
+
+        return httpx2.AsyncClient(
+            headers=dict(self.spec.headers) or None,
+            trust_env=False,
+            timeout=httpx2.Timeout(30.0, read=self.spec.call_timeout),
+        )
 
     def close(self) -> None:
         self._stop.set()

@@ -113,6 +113,8 @@ MCP_HTTP_SERVERS=remote=http://127.0.0.1:8765/mcp
 
 Remote tools are discovered, namespaced `mcp.<server>.<tool>` and registered in the same registry as local tools. They are then subject to the same policy decision, the same approval workflow and the same audit record — the firewall does not know MCP exists.
 
+Both transports are implemented and tested: **stdio** (subprocess servers) and **Streamable HTTP** (remote endpoints). One configuration note that cost real debugging time: `use_system_proxy` defaults to `False`, because a proxy configured for internet traffic is frequently wrong for a local endpoint — on the machine this was built on, a system proxy answered localhost MCP requests with `502` and an empty body while the MCP server logged nothing at all, which is indistinguishable from a broken server. Set it to `True` only when a genuinely remote MCP server must be reached through a proxy.
+
 Three properties are enforced rather than documented:
 
 1. **A discovered tool is not a trusted tool.** A tool the operator has not mapped becomes `action_type="unknown"`, and the policy engine escalates `unknown` to `require_approval`. So the default effect of plugging in a new server is that its tools are *visible and reviewable*, not that they can run unattended. There is deliberately no wildcard that grants a whole server.

@@ -403,6 +403,144 @@ def test_http_spec_validates_without_connecting():
     assert spec.transport == "http"
 
 
+# --- Streamable HTTP transport ----------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def http_server():
+    """Start the demo server over Streamable HTTP on a free port."""
+    import socket
+    import subprocess
+    import time
+
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+
+    process = subprocess.Popen(
+        [sys.executable, str(DEMO_SERVER), "http", str(port)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    # Poll until the port answers rather than sleeping a fixed amount, so the
+    # test is not flaky on a slow machine.
+    deadline = time.time() + 40
+    ready = False
+    while time.time() < deadline:
+        if process.poll() is not None:
+            raise RuntimeError(f"HTTP MCP server exited: {process.stderr.read()[:500]}")
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=1):
+                ready = True
+                break
+        except OSError:
+            time.sleep(0.3)
+    if not ready:
+        process.kill()
+        raise RuntimeError("HTTP MCP server did not start listening")
+
+    yield port
+
+    process.terminate()
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        process.kill()
+
+
+def test_discovers_tools_over_streamable_http(http_server):
+    """The HTTP transport must work as well as stdio, not merely be configured.
+
+    Note the `use_system_proxy=False` default: a host proxy configured for
+    internet traffic commonly answers localhost requests with 502 and an empty
+    body while the MCP server logs nothing, which is indistinguishable from a
+    broken server.
+    """
+    client = MCPClient(
+        MCPServerSpec(
+            name="demohttp",
+            transport="http",
+            url=f"http://127.0.0.1:{http_server}/mcp",
+            startup_timeout=45.0,
+            call_timeout=45.0,
+        )
+    )
+    try:
+        client.connect()
+        descriptors = client.discover()
+        names = {d.name for d in descriptors}
+        assert "mcp.demohttp.echo" in names, names
+        assert all(d.source == "mcp:http:demohttp" for d in descriptors)
+    finally:
+        client.close()
+
+
+def test_executes_over_streamable_http(http_server):
+    client = MCPClient(
+        MCPServerSpec(
+            name="demohttp",
+            transport="http",
+            url=f"http://127.0.0.1:{http_server}/mcp",
+            startup_timeout=45.0,
+            call_timeout=45.0,
+        )
+    )
+    try:
+        client.discover()
+        result = client.execute("mcp.demohttp.echo", {"payload": "over http"})
+        assert result["transport"] == "http"
+        assert "over http" in str(result)
+    finally:
+        client.close()
+
+
+def test_http_transport_is_governed_like_stdio(http_server, session, task):
+    """A tool reached over HTTP meets the same policy as one reached over stdio."""
+    source = MCPToolSource(
+        [
+            MCPClient(
+                MCPServerSpec(
+                    name="demohttp",
+                    transport="http",
+                    url=f"http://127.0.0.1:{http_server}/mcp",
+                    tool_actions={"echo": "read", "repo_stats": "read"},
+                    tool_risks={"echo": "low", "repo_stats": "low"},
+                    startup_timeout=45.0,
+                    call_timeout=45.0,
+                )
+            )
+        ]
+    )
+    local = LocalToolSource([], name="local:empty")
+    firewall = Firewall(registry=ToolRegistry([local, source]), policy_engine=PolicyEngine())
+    try:
+        # Declared read tool over HTTP: allow-listed by the MCP policy section.
+        allowed = firewall.execute(
+            ToolRequest(
+                task_id=task.id,
+                tool_name="mcp.demohttp.echo",
+                action_type="read",
+                arguments={"payload": "x"},
+            ),
+            session=session,
+        )
+        assert allowed.status in {"success", "waiting_approval"}
+        # Undeclared tool over HTTP: identical fail-closed treatment.
+        denied = firewall.execute(
+            ToolRequest(
+                task_id=task.id,
+                tool_name="mcp.demohttp.scratch_write",
+                action_type="unknown",
+                arguments={"name": "n.txt", "content": "x"},
+            ),
+            session=session,
+        )
+        assert denied.status == "waiting_approval"
+    finally:
+        source.close()
+
+
 def test_source_execute_routes_to_the_owning_server(client):
     source = MCPToolSource([client])
     result = source.execute("mcp.demo.echo", {"payload": "routed"})
