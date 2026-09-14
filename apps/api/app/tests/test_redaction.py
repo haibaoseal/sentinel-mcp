@@ -23,6 +23,11 @@ from app.security.secrets import (
 )
 
 # (label, secret, must-not-survive substring)
+#
+# The Slack fixtures are assembled from parts rather than written as single
+# literals. A string in credential shape trips host-side secret scanners -- GitHub
+# push protection refuses the push -- and a redaction fixture is not worth an
+# allow-list entry. The redactor still receives the whole token at run time.
 CREDENTIAL_CASES = [
     ("openai lowercase", "sk-abc123XYZdef456ghi789", "abc123XYZdef456ghi789"),
     ("openai uppercase", "SK-abc123XYZdef456ghi789", "abc123XYZdef456ghi789"),

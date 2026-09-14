@@ -69,6 +69,8 @@ cases = [
     ("openai lowercase", "sk-abc123XYZdef456ghi789"),
     ("openai UPPERCASE", "SK-abc123XYZdef456ghi789"),
     ("github token", "ghp_abcdefghijklmnopqrstuvwx"),
+    # Assembled from parts: a literal in this shape is blocked by GitHub push
+    # protection, and the redactor sees the whole token either way.
     ("slack token", "xoxb-" + "123456789012" + "-" + "abcdefghijklmnop"),
     ("google key", "AIzaSyA1B2C3D4E5F6G7H8I9J0KLMNOPQRSTUV"),
     ("aws key", "AKIAIOSFODNN7EXAMPLE"),

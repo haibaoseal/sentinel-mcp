@@ -120,6 +120,8 @@ leaked = [
         "sk-abc123XYZdef456ghi789",
         "SK-abc123XYZdef456ghi789",
         "ghp_abcdefghijklmnopqrstuvwx",
+        # Assembled from parts: a literal in this shape is blocked by GitHub push
+        # protection, and the redactor sees the whole token either way.
         "xoxb-" + "123456789012" + "-" + "abcdefghijklmnop",
         "110101199003071234",
         "138 0013 8000",
