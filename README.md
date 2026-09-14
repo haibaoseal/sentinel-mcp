@@ -61,10 +61,18 @@ python -m venv .venv
 # POSIX:   source .venv/bin/activate
 python -m pip install -e ".[dev]"
 
-python -m pytest apps/api/app/tests   # 183 tests
-python -m ruff check apps/api/app scripts
-python -m ruff format --check apps/api/app scripts
+python -m pytest apps/api/app/tests   # 293 tests
+python -m ruff check apps/api/app mcp_servers scripts
+python -m ruff format --check apps/api/app mcp_servers scripts
 ```
+
+For the exact versions the suite is verified against:
+
+```bash
+python -m pip install -e ".[dev]" -c constraints.txt
+```
+
+`constraints.txt` pins direct dependencies. It is deliberately **not** presented as a full transitive lock: generating one needs `uv lock` or `pip-compile`, and the attempt here produced conda-local artifacts (`@ file://…`) that are not installable elsewhere. `pyproject.toml` carries upper bounds so a plain install is bounded rather than open-ended.
 
 ### Watch the agent get governed
 
