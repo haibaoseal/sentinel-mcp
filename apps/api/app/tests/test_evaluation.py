@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 from app.evals.evaluator import (
     EvalConfigurationError,
+    SuiteResult,
     compute_metrics,
     evaluate_trace,
     load_scenarios,
@@ -20,6 +21,7 @@ from app.evals.evaluator import (
 )
 from app.evals.runner import (
     GATED_METRICS,
+    check_inventory,
     compare_to_baseline,
     load_baseline,
     render_report,
@@ -155,8 +157,9 @@ def test_contract_check_flags_an_unknown_negative_expectation_too():
         [{"id": "neg", "question": "q", "expect": {"must_not_execute": ["ghost_tool"]}}],
         known_tools={"fs_read"},
     )
-    assert problems
-    assert "unregistered tool" in problems[0]
+    assert any("unregistered tool" in problem for problem in problems)
+    # The same scenario is also negative-only, which is a second reason to refuse it.
+    assert any("only negative expectations" in problem for problem in problems)
 
 
 def test_contract_check_flags_a_scenario_with_no_expectations():
@@ -329,7 +332,7 @@ def test_shipped_baseline_exists_and_covers_the_suite(suite):
 
 def test_shipped_baseline_does_not_regress_against_a_fresh_run(suite):
     recorded = load_baseline()
-    assert compare_to_baseline(suite.metrics, recorded) == []
+    assert compare_to_baseline(suite.metrics, recorded, inventory=check_inventory(suite)) == []
 
 
 def test_every_shipped_scenario_passes(suite):
@@ -340,3 +343,214 @@ def test_every_shipped_scenario_passes(suite):
         if not result.passed
     ]
     assert not failures, failures
+
+
+# --- the contract check, after the second audit -------------------------------
+#
+# Each of these is a way a scenario can assert nothing while passing, and each was
+# found by an adversarial review of the suite rather than by a failing run.
+
+
+def test_a_misspelled_expectation_key_is_a_contract_error():
+    """`must_not_excecute` asserted nothing, and nothing counted it either."""
+    problems = validate_contracts(
+        [{"id": "typo", "question": "q", "expect": {"must_not_excecute": ["ghost_tool"]}}],
+        known_tools={"fs_read"},
+    )
+    assert any("unknown expectation key" in problem for problem in problems)
+
+
+def test_a_duplicate_scenario_id_is_a_contract_error():
+    duplicate = {"id": "dup", "question": "q", "expect": {"must_execute": ["fs_read"]}}
+    problems = validate_contracts([duplicate, dict(duplicate)], known_tools={"fs_read"})
+    assert any("share this id" in problem for problem in problems)
+
+
+def test_a_negative_only_scenario_is_a_contract_error():
+    """Nothing is required to happen, so a missing implementation passes."""
+    problems = validate_contracts(
+        [{"id": "neg", "question": "q", "expect": {"must_not_execute": ["fs_read"]}}],
+        known_tools={"fs_read"},
+    )
+    assert any("only negative expectations" in problem for problem in problems)
+
+
+def test_every_shipped_scenario_has_a_positive_expectation():
+    from app.core.config import Settings
+    from app.runtime import build_runtime
+
+    runtime = build_runtime(Settings(_env_file=None, agent_provider="replay"))
+    scenarios = load_scenarios()["scenarios"]
+    assert validate_contracts(scenarios, set(runtime.registry.names())) == []
+    assert all(len(scenario["expect"]) >= 1 for scenario in scenarios)
+
+
+# --- the baseline inventory ---------------------------------------------------
+
+
+def test_the_baseline_records_a_check_inventory(suite, tmp_path):
+    target = tmp_path / "baseline.json"
+    write_baseline(suite, target)
+    recorded = load_baseline(target)
+
+    assert set(recorded["inventory"]) == {result.scenario_id for result in suite.results}
+    assert all(rules for rules in recorded["inventory"].values())
+
+
+def test_the_gate_catches_a_scenario_that_lost_checks(suite):
+    """The totals held, so the evidence-shrink rule could not see this."""
+    inventory = check_inventory(suite)
+    baseline = {"metrics": suite.metrics, "inventory": inventory}
+
+    weakened = dict(inventory)
+    first = next(iter(weakened))
+    weakened[first] = weakened[first][:-1]
+
+    regressions = compare_to_baseline(suite.metrics, baseline, inventory=weakened)
+
+    assert [regression.kind for regression in regressions] == ["inventory"]
+    assert regressions[0].metric == f"scenario:{first}"
+    assert "lost checks" in regressions[0].describe()
+
+
+def test_the_gate_catches_a_scenario_that_disappeared(suite):
+    inventory = check_inventory(suite)
+    baseline = {"metrics": suite.metrics, "inventory": inventory}
+
+    smaller = dict(inventory)
+    smaller.pop(next(iter(smaller)))
+
+    regressions = compare_to_baseline(suite.metrics, baseline, inventory=smaller)
+
+    assert [regression.kind for regression in regressions] == ["inventory"]
+    assert regressions[0].observed_total == 0
+
+
+def test_adding_checks_is_not_a_regression(suite):
+    inventory = check_inventory(suite)
+    baseline = {"metrics": suite.metrics, "inventory": inventory}
+    richer = {key: [*rules, "must_execute:something_new"] for key, rules in inventory.items()}
+
+    assert compare_to_baseline(suite.metrics, baseline, inventory=richer) == []
+
+
+# --- metrics say what they measured ------------------------------------------
+
+
+def test_governance_refusals_counts_only_calls_that_were_attempted():
+    """`must_not_execute: X` where X was never proposed is not governance evidence.
+
+    The headline metric counted all 28 of them; four had the tool actually proposed.
+    Both numbers are now reported, so neither is mistaken for the other.
+    """
+    builder = TraceBuilder(run_id="r", question="q", identity=ProviderIdentity(provider="replay"))
+    builder.tool_span(tool_name="delete_file", status="blocked")
+    trace = builder.finish(answer="blocked", status="blocked", termination="completed")
+
+    result = evaluate_trace(
+        trace,
+        {
+            "id": "s",
+            "question": "q",
+            "expect": {"must_not_execute": ["delete_file", "send_email"]},
+        },
+    )
+    metrics = compute_metrics([result])
+
+    assert metrics["unsafe_execution"] == {"passed": 2, "total": 2, "rate": 1.0}
+    assert metrics["governance_refusals"] == {"passed": 1, "total": 1, "rate": 1.0}
+
+
+def test_every_check_belongs_to_a_gated_metric(suite):
+    """The gate protected 47 of 87 checks before this; it now covers all of them."""
+    gated_prefixes = (
+        "must_not_execute:",
+        "must_hold:",
+        "must_block:",
+        "grounded:",
+        "input_guardrail",
+        "guardrail_rule",
+        "answer_excludes:",
+        "must_propose:",
+        "must_execute:",
+        "must_not_propose:",
+        "status",
+        "termination",
+        "must_not_status:",
+        "policy_rules",
+        "answer_contains_any:",
+        "output_guardrail",
+    )
+    ungated = {
+        check.rule
+        for result in suite.results
+        for check in result.checks
+        if not check.rule.startswith(gated_prefixes)
+    }
+    assert ungated == set()
+
+
+# --- the report and the CLI ---------------------------------------------------
+
+
+def test_the_report_handles_an_empty_suite():
+    """`total` is 0 rather than None, so the guard crashed on the case it described."""
+    empty = SuiteResult(
+        suite_version="1",
+        is_live=False,
+        provider="replay",
+        model="m",
+        results=[],
+        metrics=compute_metrics([]),
+    )
+    text = render_report(empty, [])
+    assert "no checks -- not reported as a rate" in text
+
+
+def test_cli_exit_codes(tmp_path):
+    """The four exit codes the CLI documents, none of which had a test."""
+    from app.evals.cli import EXIT_CONFIG, EXIT_FAILURES, EXIT_OK, EXIT_REGRESSION, main
+
+    shipped = json.loads(
+        (Path(__file__).resolve().parents[4] / "evals" / "scenarios.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    small = {
+        "suite_version": shipped.get("suite_version", "1"),
+        "scenarios": [shipped["scenarios"][0]],
+    }
+    small_path = tmp_path / "small.json"
+    small_path.write_text(json.dumps(small, ensure_ascii=False), encoding="utf-8")
+
+    # 3 -- a contract violation stops the suite before it runs anything.
+    broken = json.loads(json.dumps(small))
+    broken["scenarios"].append(
+        {"id": "ghost", "question": "q", "expect": {"must_block": ["nonexistent_tool"]}}
+    )
+    broken_path = tmp_path / "broken.json"
+    broken_path.write_text(json.dumps(broken, ensure_ascii=False), encoding="utf-8")
+    assert main(["--scenarios", str(broken_path)]) == EXIT_CONFIG
+
+    # 0 -- a clean run with no baseline to compare against.
+    assert main(["--scenarios", str(small_path), "--no-gate"]) == EXIT_OK
+
+    # 1 -- a scenario failed.
+    failing = json.loads(json.dumps(small))
+    failing["scenarios"][0]["expect"]["must_execute"] = ["fs_read"]
+    failing_path = tmp_path / "failing.json"
+    failing_path.write_text(json.dumps(failing, ensure_ascii=False), encoding="utf-8")
+    assert main(["--scenarios", str(failing_path), "--no-gate"]) == EXIT_FAILURES
+
+    # 2 -- a gated metric regressed against a recorded baseline.
+    recorded = tmp_path / "baseline.json"
+    assert (
+        main(["--scenarios", str(small_path), "--update-baseline", "--baseline", str(recorded)])
+        == EXIT_OK
+    )
+    data = json.loads(recorded.read_text(encoding="utf-8"))
+    data["metrics"]["unsafe_execution"]["passed"] += 1
+    data["metrics"]["unsafe_execution"]["total"] += 1
+    recorded.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+
+    assert main(["--scenarios", str(small_path), "--baseline", str(recorded)]) == EXIT_REGRESSION

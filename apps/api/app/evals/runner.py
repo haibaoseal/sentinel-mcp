@@ -45,13 +45,37 @@ BASELINE_PATH = Path(__file__).resolve().parents[4] / "evals" / "baseline.json"
 GATED_METRICS = (
     "scenarios",
     "unsafe_execution",
+    "governance_refusals",
     "gated_tools",
     "blocked_tools",
     "grounding",
     "input_guardrail",
     "guardrail_rule_fired",
     "honest_failure_reporting",
+    # The positive half, added after an audit measured that the gate protected 47 of
+    # the suite's 87 checks: every "the tool was proposed / executed" and "the run
+    # completed" assertion sat outside it, and those are the expensive ones.
+    "tool_proposals",
+    "tool_execution",
+    "tool_non_proposals",
+    "run_outcome",
+    "policy_evidence",
+    "answer_content",
+    "output_guardrail",
 )
+
+
+def check_inventory(suite: SuiteResult) -> dict[str, list[str]]:
+    """Every check rule per scenario, in a stable order.
+
+    Stored in the baseline so the gate can tell a *weakened* scenario from a
+    *replaced* one. The evidence-shrink rule compares totals, and totals hold while
+    a strong scenario is swapped for a weak one asserting the same number of things.
+    """
+    return {
+        result.scenario_id: sorted(check.rule for check in result.checks)
+        for result in suite.results
+    }
 
 
 @dataclass
@@ -68,6 +92,12 @@ class Regression:
             return (
                 f"{self.metric}: {self.baseline_total} checks -> {self.observed_total} "
                 f"(evidence for this metric shrank)"
+            )
+        if self.kind == "inventory":
+            return (
+                f"{self.metric}: {self.baseline_total} checks -> {self.observed_total} "
+                f"(the scenario lost checks; a replaced scenario looks unchanged to a "
+                f"totals-only gate)"
             )
         return f"{self.metric}: {self.baseline:.4f} -> {self.observed:.4f}"
 
@@ -139,17 +169,23 @@ def raise_contract_error(problems: list[str]) -> None:
     raise EvalConfigurationError("scenario contract violations:\n  " + "\n  ".join(problems))
 
 
-def compare_to_baseline(metrics: dict[str, Any], baseline: dict[str, Any]) -> list[Regression]:
+def compare_to_baseline(
+    metrics: dict[str, Any],
+    baseline: dict[str, Any],
+    *,
+    inventory: dict[str, list[str]] | None = None,
+) -> list[Regression]:
     """Return the gated metrics that regressed.
 
-    Two distinct kinds are checked, and the second is the one that is easy to miss:
+    Three kinds are checked, and the last two are the easy ones to miss:
 
     1. **Rate drop** -- fewer of the checks that ran passed.
     2. **Evidence shrink** -- the *number* of checks fell while the rate stayed at
        1.0. Deleting or weakening assertions removes checks, and a rate-only
-       comparison cannot see it: 3 of 3 and 8 of 8 both report 1.0. This is how a
-       suite gets quietly hollowed out while still reporting a perfect score, so the
-       count is gated as well as the ratio.
+       comparison cannot see it: 3 of 3 and 8 of 8 both report 1.0.
+    3. **Lost checks inside a scenario** -- totals held while a scenario's own
+       assertions changed. Only visible when an inventory is supplied, which is why
+       the baseline records one.
     """
     regressions: list[Regression] = []
     recorded = baseline.get("metrics") or {}
@@ -189,6 +225,22 @@ def compare_to_baseline(metrics: dict[str, Any], baseline: dict[str, Any]) -> li
                     )
                 )
 
+    if inventory is not None:
+        for scenario_id, recorded_rules in (baseline.get("inventory") or {}).items():
+            observed_rules = inventory.get(scenario_id)
+            if observed_rules is not None and not set(recorded_rules) - set(observed_rules):
+                continue
+            regressions.append(
+                Regression(
+                    metric=f"scenario:{scenario_id}",
+                    baseline=0.0,
+                    observed=0.0,
+                    kind="inventory",
+                    baseline_total=len(recorded_rules),
+                    observed_total=len(observed_rules or []),
+                )
+            )
+
     return regressions
 
 
@@ -216,6 +268,7 @@ def write_baseline(suite: SuiteResult, path: Path | None = None) -> Path:
             "gated metric falls below these values. Update deliberately, never automatically."
         ),
         "metrics": suite.metrics,
+        "inventory": check_inventory(suite),
     }
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
@@ -244,7 +297,9 @@ def render_report(suite: SuiteResult, regressions: list[Regression] | None = Non
     lines.append("metrics (passed/total):")
     for name in GATED_METRICS:
         entry = suite.metrics.get(name)
-        if not isinstance(entry, dict) or entry.get("total") is None:
+        # An empty suite gives total=0 and rate=None, so testing only for None crashed
+        # the report on exactly the case this branch describes.
+        if not isinstance(entry, dict) or not entry.get("total") or entry.get("rate") is None:
             lines.append(f"  {name:26} (no checks -- not reported as a rate)")
             continue
         lines.append(f"  {name:26} {entry['passed']}/{entry['total']}  rate={entry['rate']:.4f}")
@@ -269,7 +324,3 @@ def render_report(suite: SuiteResult, regressions: list[Regression] | None = Non
             lines.append("no regression against baseline")
 
     return "\n".join(lines)
-
-
-def scenario_ids_from_document(path: Path | None = None) -> list[str]:
-    return [scenario["id"] for scenario in load_scenarios(path)["scenarios"]]

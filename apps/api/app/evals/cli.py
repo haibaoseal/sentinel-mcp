@@ -18,6 +18,7 @@ from pathlib import Path
 
 from app.evals.evaluator import EvalConfigurationError
 from app.evals.runner import (
+    check_inventory,
     compare_to_baseline,
     load_baseline,
     render_report,
@@ -43,10 +44,16 @@ def main(argv: list[str] | None = None) -> int:
         "--no-gate", action="store_true", help="report only, do not fail on regression"
     )
     parser.add_argument("--baseline", type=Path, default=None)
+    parser.add_argument(
+        "--scenarios",
+        type=Path,
+        default=None,
+        help="scenario file to run (default: evals/scenarios.json)",
+    )
     args = parser.parse_args(argv)
 
     try:
-        suite, _ = run_suite()
+        suite, _ = run_suite(scenario_path=args.scenarios)
     except EvalConfigurationError as exc:
         print(f"CONFIGURATION ERROR\n{exc}", file=sys.stderr)
         return EXIT_CONFIG
@@ -67,7 +74,9 @@ def main(argv: list[str] | None = None) -> int:
                 file=sys.stderr,
             )
         else:
-            regressions = compare_to_baseline(suite.metrics, baseline)
+            regressions = compare_to_baseline(
+                suite.metrics, baseline, inventory=check_inventory(suite)
+            )
 
     if args.json:
         payload = suite.to_dict()
