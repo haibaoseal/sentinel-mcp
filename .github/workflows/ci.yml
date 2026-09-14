@@ -98,6 +98,11 @@ jobs:
       - name: Verify governance guarantees
         run: python scripts/verify_p0_fixes.py
 
+      # Reads code and data and asserts each README claim directly, so a claim that
+      # stops holding fails the build rather than quietly becoming false.
+      - name: Verify the project's claims
+        run: python scripts/verify_objective.py
+
       # Spawns a real MCP server over stdio and drives it through the firewall.
       # Requires the MCP SDK, which the [dev] extra does not include because the
       # outbound half of the gateway has no such dependency.
