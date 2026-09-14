@@ -229,7 +229,38 @@ class ReplayProvider:
         if not results:
             return "没有可执行的步骤。请补充更具体的请求。"
 
+        # Answer from the evidence that was actually retrieved, and cite it. An
+        # answer that retrieved policy chunks and then cites nothing is exactly
+        # what the output guardrail refuses, and it should: "I retrieved the
+        # policy" followed by an uncited claim is the failure mode the grounding
+        # check exists to catch.
+        citation = _first_citation(results)
+        if citation:
+            excerpt = str(citation.get("excerpt") or "").strip()
+            summary = excerpt.split("\n")[0][:120]
+            return f"根据检索到的政策证据：{summary}（依据【{citation['id']}】）"
         return "已按受治理的工作流完成请求。"
+
+
+def _first_citation(results: Sequence[ProviderToolResult]) -> dict[str, Any] | None:
+    """The top citation from the most recent successful retrieval, if any."""
+    import json
+
+    for result in reversed(list(results)):
+        if result.status != "success":
+            continue
+        try:
+            payload = json.loads(result.content)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        citations = payload.get("citations")
+        if isinstance(citations, list) and citations:
+            first = citations[0]
+            if isinstance(first, dict) and first.get("id"):
+                return first
+    return None
 
 
 def detect_intent(request: str) -> Intent:

@@ -60,6 +60,11 @@ jobs:
       - name: Governed agent demo
         run: python scripts/demo_agent.py
 
+      # Reproduces the bypasses the guardrails exist to stop. If a pattern is
+      # weakened, this fails even when the unit tests were adjusted to match.
+      - name: Guardrail demo
+        run: python scripts/demo_guardrails.py
+
   # Guards the property that makes this project worth reading: tool execution has
   # exactly one authorised path. Adding a transport (MCP over stdio or HTTP) must
   # not create a second, ungoverned route to a tool.

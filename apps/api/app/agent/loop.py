@@ -34,6 +34,7 @@ from app.providers.base import (
     ProviderToolResult,
     ProviderToolSpec,
 )
+from app.security.guardrails import GuardrailResult, check_input, check_output
 
 SYSTEM_PROMPT = (
     "You are a tool-using assistant operating under a governance layer.\n"
@@ -53,6 +54,7 @@ TERMINATION_MAX_TURNS = "max_turns"
 TERMINATION_REPEATED_CALL = "repeated_call"
 TERMINATION_PROVIDER_ERROR = "provider_error"
 TERMINATION_COMPLETED = "completed"
+TERMINATION_GUARDRAIL = "guardrail"
 
 
 @dataclass
@@ -77,6 +79,9 @@ class AgentRunResult:
     termination: str = TERMINATION_COMPLETED
     usage: dict[str, int] | None = None
     error: str | None = None
+    # The guardrail verdict for the run, when one was reached. Exposed so a caller
+    # can see what was checked and not only what failed.
+    guardrail: Any = None
 
 
 class AgentLoop:
@@ -105,6 +110,32 @@ class AgentLoop:
         ]
 
     def run(self, *, task_id: str, user_request: str, session: Session) -> AgentRunResult:
+        # Screen the request before any tool is proposed. A detected injection is a
+        # *blocking* input finding, not a warning: the archived design treated
+        # detection as advisory and then relied on the policy engine alone, which
+        # meant an injection that only manipulated wording had no effect at all.
+        input_check = check_input(user_request)
+        if not input_check.allowed:
+            return AgentRunResult(
+                status="blocked",
+                answer=(
+                    "请求已被输入防护拦截：检测到试图改变指令或获取系统提示的内容。"
+                    if _looks_chinese(user_request)
+                    else "Request blocked by the input guardrail: it attempts to change "
+                    "instructions or extract the system prompt."
+                ),
+                steps=[
+                    LoopStep(
+                        index=0,
+                        decision_kind="guardrail",
+                        error_code="INPUT_GUARDRAIL_BLOCK",
+                        detail=input_check.summary(),
+                    )
+                ],
+                termination=TERMINATION_GUARDRAIL,
+                guardrail=input_check,
+            )
+
         messages: list[ProviderMessage] = [
             ProviderMessage(role="system", content=SYSTEM_PROMPT),
             ProviderMessage(role="user", content=user_request),
@@ -113,6 +144,7 @@ class AgentLoop:
         steps: list[LoopStep] = []
         results: list[ProviderToolResult] = []
         seen_calls: set[tuple[str, str]] = set()
+        citations: list[dict[str, Any]] = []
         usage: dict[str, int] | None = None
 
         for turn in range(1, self.max_turns + 1):
@@ -151,6 +183,42 @@ class AgentLoop:
                 # internal validation string reach a user under a green badge.
                 if status != "completed":
                     answer = _governed_answer(status, results, answer)
+
+                # Screen the answer itself.
+                #
+                # Grounding applies only to a *substantive, model-authored* answer.
+                # Two cases must not be grounded, or they get refused for the wrong
+                # reason: a governance refusal (there is nothing to cite when the
+                # answer is "this was blocked"), and a conversational reply. The
+                # capability-claim check still runs on both, because "I did it" is
+                # never acceptable to overstate.
+                governance_answer = status != "completed"
+                output_check = check_output(
+                    answer,
+                    citations,
+                    policy_relevant=bool(citations) and not governance_answer,
+                )
+                if not output_check.allowed:
+                    steps.append(
+                        LoopStep(
+                            index=turn,
+                            decision_kind="guardrail",
+                            error_code="OUTPUT_GUARDRAIL_BLOCK",
+                            detail=output_check.summary(),
+                        )
+                    )
+                    status = "failed" if status == "completed" else status
+                    answer = _guardrail_refusal(output_check, answer)
+                    return AgentRunResult(
+                        status=status,
+                        answer=answer,
+                        steps=steps,
+                        tool_results=results,
+                        termination=TERMINATION_GUARDRAIL,
+                        usage=usage,
+                        guardrail=output_check,
+                    )
+
                 return AgentRunResult(
                     status=status,
                     answer=answer,
@@ -158,6 +226,7 @@ class AgentLoop:
                     tool_results=results,
                     termination=TERMINATION_COMPLETED,
                     usage=usage,
+                    guardrail=output_check,
                 )
 
             messages.append(
@@ -191,6 +260,11 @@ class AgentLoop:
 
                 outcome = self._invoke(call, task_id=task_id, session=session)
                 results.append(outcome)
+                # Remember any evidence this call retrieved, so the output
+                # guardrail can check the answer against the same chunks the agent
+                # actually saw. Without this the grounding check has nothing to
+                # compare against and silently passes everything.
+                citations.extend(_citations_from(outcome))
                 steps.append(
                     LoopStep(
                         index=turn,
@@ -249,6 +323,57 @@ class AgentLoop:
             content=_render(result),
             error=result.error,
         )
+
+
+def _citations_from(outcome: ProviderToolResult) -> list[dict[str, Any]]:
+    """Pull citation objects out of a tool result, if it carried any.
+
+    Reads the structured payload the knowledge tool returns rather than scraping
+    the rendered text, so a change to presentation cannot silently disable
+    grounding.
+    """
+    import json
+
+    if outcome.status != "success":
+        return []
+    try:
+        payload = json.loads(outcome.content)
+    except (ValueError, TypeError):
+        return []
+    if not isinstance(payload, dict):
+        return []
+    found: list[dict[str, Any]] = []
+    for key in ("citations", "structured"):
+        value = payload.get(key)
+        if isinstance(value, dict):
+            value = value.get("citations")
+        if isinstance(value, list):
+            found.extend(item for item in value if isinstance(item, dict) and item.get("id"))
+    return found
+
+
+def _guardrail_refusal(check: GuardrailResult, model_answer: str) -> str:
+    """Replace an answer the output guardrail refused.
+
+    Grounding is skipped for governance answers, so what reaches here is an
+    unsupported capability claim or a policy answer whose citations do not hold up.
+    The message names which, because a refusal the user cannot act on is barely
+    better than the false answer it replaced.
+    """
+    blocking = [f for f in check.findings if f.severity in {"high", "critical"}]
+    if any(f.name.startswith("unsupported_capability_claim") for f in blocking):
+        return (
+            "已拦截该回答：它声称完成了某个动作，但工具能力不允许这样做，"
+            "且所引用的证据并不支持该说法。退款、删除与发送类操作均为 dry-run，"
+            "本系统不会声称它们已经完成。"
+        )
+    if any(f.name.startswith("citation") or f.name == "answer_has_no_citation" for f in blocking):
+        return "已拦截该回答：其中的引用无法支持所陈述的内容，因此未予返回。"
+    return "已拦截该回答：它未通过输出防护检查。"
+
+
+def _looks_chinese(text: str) -> bool:
+    return any("\u4e00" <= ch <= "\u9fff" for ch in text or "")
 
 
 def _render(result) -> str:
