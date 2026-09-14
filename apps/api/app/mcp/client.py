@@ -33,6 +33,7 @@ governance decision should not depend on an event loop being driven correctly.
 from __future__ import annotations
 
 import asyncio
+import re
 import threading
 from dataclasses import dataclass, field
 from typing import Any, Literal
@@ -53,6 +54,27 @@ Transport = Literal["stdio", "http"]
 # tool server" should imply.
 ENV_ALLOWLIST = ("PATH", "HOME", "USERPROFILE", "SYSTEMROOT", "TEMP", "TMP", "LANG", "LC_ALL")
 
+# A remote tool description is the one field a server controls that is copied into
+# the model's prompt, so it is bounded and flattened before it gets there.
+MAX_DESCRIPTION_CHARS = 1000
+
+# A result is returned to the model *and* written into the hash-chained audit
+# payload, so an unbounded one is a memory and audit DoS rather than a convenience.
+MAX_REMOTE_RESULT_BYTES = 512 * 1024
+
+
+def clean_remote_description(text: str) -> str:
+    """Bound and flatten a description supplied by a remote server.
+
+    Two things are removed beyond the length cap. Control characters and newlines, so
+    a description cannot fake a message boundary in the prompt. And the
+    ``[governed: ...]`` prefix this codebase publishes on its own outbound tools, so a
+    hostile server cannot make its description read as though this runtime wrote it.
+    """
+    flattened = " ".join(str(text).split())
+    without_prefix = re.sub(r"\[governed:[^\]]*\]", "", flattened, flags=re.IGNORECASE)
+    return without_prefix[:MAX_DESCRIPTION_CHARS]
+
 
 @dataclass(frozen=True)
 class MCPServerSpec:
@@ -70,7 +92,6 @@ class MCPServerSpec:
     # escalates to require_approval.
     tool_actions: dict[str, ActionType] = field(default_factory=dict)
     tool_risks: dict[str, RiskLevel] = field(default_factory=dict)
-    enabled: bool = True
     startup_timeout: float = 45.0
     call_timeout: float = 60.0
     # Whether the host's HTTP proxy configuration applies to this server.
@@ -137,7 +158,27 @@ class MCPClient:
     def connect(self) -> None:
         with self._start_lock:
             if self._thread is not None and self._thread.is_alive():
+                # A live thread is not the same thing as a working connection. When
+                # an earlier attempt failed, its worker is still winding down, and
+                # every later connect() used to return *success* against a dead
+                # session because only thread liveness was consulted.
+                if self._failure is not None:
+                    raise MCPServerError(
+                        f"MCP server {self.spec.name!r} is not connected: {self._failure}"
+                    ) from self._failure
+                # Another caller is starting or using this connection: wait for its
+                # verdict instead of starting a second worker over the top of it.
+                if not self._ready.wait(timeout=self.spec.startup_timeout):
+                    raise MCPServerError(
+                        f"MCP server {self.spec.name!r} did not become ready within "
+                        f"{self.spec.startup_timeout}s"
+                    )
+                if self._failure is not None:
+                    raise MCPServerError(
+                        f"MCP server {self.spec.name!r} failed to start: {self._failure}"
+                    ) from self._failure
                 return
+
             self._ready.clear()
             self._stop.clear()
             self._failure = None
@@ -290,7 +331,11 @@ class MCPClient:
         try:
             return future.result(timeout=timeout)
         except TimeoutError as exc:
-            future.cancel()
+            # Deliberately *not* cancelling the future. The request is already in
+            # flight; cancelling it made the worker raise InvalidStateError when the
+            # late result arrived, which unwound the session and killed the child
+            # process -- so one slow call destroyed the whole connection rather than
+            # just failing. The result is dropped instead and the caller is told.
             raise MCPServerError(f"MCP {kind} on {self.spec.name!r} exceeded {timeout}s") from exc
 
     @staticmethod
@@ -342,7 +387,7 @@ class MCPClient:
             self._records[qualified] = _ToolRecord(
                 remote_name=remote_name,
                 qualified_name=qualified,
-                description=getattr(tool, "description", "") or "",
+                description=clean_remote_description(getattr(tool, "description", "") or ""),
                 input_schema=getattr(tool, "input_schema", None)
                 or {"type": "object", "properties": {}},
                 action_type=action,
@@ -400,6 +445,15 @@ class MCPClient:
             if isinstance(text, str):
                 content_parts.append(text)
         text = "\n".join(content_parts)
+        if len(text.encode("utf-8")) > MAX_REMOTE_RESULT_BYTES:
+            # Bounded because this text is handed to the model *and* written into the
+            # hash-chained audit payload; an unbounded result is a memory and audit
+            # DoS from a server the operator only half trusts.
+            raise ToolExecutionError(
+                f"remote tool {record.qualified_name} returned "
+                f"{len(text.encode('utf-8'))} bytes, above the "
+                f"{MAX_REMOTE_RESULT_BYTES} byte limit"
+            )
         structured = getattr(result, "structured_content", None)
         is_error = bool(getattr(result, "is_error", False))
 
@@ -452,12 +506,27 @@ class MCPToolSource:
     def __init__(self, clients: list[MCPClient]) -> None:
         self._clients = clients
         self.name = "mcp"
+        #: Servers that could not be reached during discovery, as
+        #: ``"<server>: <reason>"``. Populated by ``descriptors()`` and reported rather
+        #: than raised, so a broken third-party server degrades the tool list instead
+        #: of the runtime.
+        self.failures: list[str] = []
 
     def descriptors(self) -> list[ToolDescriptor]:
         descriptors: list[ToolDescriptor] = []
         seen: set[str] = set()
+        self.failures = []
         for client in self._clients:
-            for descriptor in client.discover():
+            try:
+                discovered = client.discover()
+            except (MCPServerError, MCPToolNotAllowedError) as exc:
+                # One unreachable or misbehaving server must not take the runtime down.
+                # The registry is built from every source at once, so an exception here
+                # used to fail startup for the local tools as well -- a third-party
+                # server that advertises a tool named `evil/x` could stop the agent.
+                self.failures.append(f"{client.spec.name}: {exc}")
+                continue
+            for descriptor in discovered:
                 if descriptor.name in seen:
                     raise MCPToolNotAllowedError(
                         f"two MCP servers advertised the same tool name: {descriptor.name}"

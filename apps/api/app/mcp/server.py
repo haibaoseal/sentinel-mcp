@@ -36,6 +36,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from app.core.contracts import ToolRequest
+from app.core.errors import MCPToolNotAllowedError
 from app.db.models import AgentTask
 from app.governance.firewall import Firewall
 
@@ -75,8 +76,21 @@ class GovernedMCPServer:
         before calling; hiding the gating would make the refusal look arbitrary.
         """
         described: list[dict[str, Any]] = []
+        published: dict[str, str] = {}
         for descriptor in self.firewall.registry.descriptors():
             exposed = self._exposed_name(descriptor.name)
+            claimed = published.get(exposed)
+            if claimed is not None and claimed != descriptor.name:
+                # Two upstream names can flatten to one published name: server `demo`
+                # with tool `http.echo` and server `demo_http` with tool `echo` both
+                # become `<prefix>demo__http__echo`. Publishing one and silently
+                # routing to the other is a name-confusion bug the external client
+                # cannot see, so this refuses instead of picking a winner.
+                raise MCPToolNotAllowedError(
+                    f"two tools publish under the same name {exposed!r}: "
+                    f"{claimed!r} and {descriptor.name!r}"
+                )
+            published[exposed] = descriptor.name
             described.append(
                 {
                     "name": exposed,
