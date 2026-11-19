@@ -9,11 +9,84 @@ The premise of this project is that the hard part of shipping an agent is not ma
 
 `sentinel-mcp` sits between an agent and every tool it can reach — local Python functions and remote MCP servers alike — and makes each proposed call pass a policy decision, an optional human approval, and an append-only audit chain.
 
-> **Status: Phases 0–8 of a staged build are complete** — the governance core, the provider-abstracted agent loop, the real tools, the MCP gateway (both directions), the guardrails, the deterministic evaluation harness with a regression gate, live-path verification against a vendor stub, and the **approval round trip**: a held call becomes a pending `ApprovalRequest`, a reviewer approves (optionally with edited arguments, which are re-evaluated), rejects, or leaves it, and an approved call executes through the same firewall. See [Approving a held call](#approving-a-held-call) and [Roadmap](#roadmap).
+> **Status: v0.2.0 — governance core plus a deployable HTTP control plane.** Phases 0–8 and 10 are complete, and the service layer adds a REST API, tenant-scoped API keys with RBAC, Prometheus metrics, Alembic migrations, Docker/Postgres deployment, retry/circuit-breaker handling and audit export. Phase 9 (resuming an agent run after an approval) remains planned. See [Production readiness](docs/PRODUCTION_READINESS.md) for the honest Done/Partial/Planned matrix.
 
 ## Why this exists
 
 Most agent projects demonstrate that a model *can* act. Very few demonstrate that you can stop it, review it, and audit it. This one is a governance layer, not a chatbot, and it treats tool execution as a privileged operation rather than a function call.
+
+## Service mode
+
+The governance core is also a deployable HTTP service. It adds the parts an
+operator needs before a business system can call it:
+
+- a versioned REST API with OpenAPI at `/docs`;
+- API keys bound to a tenant, a role and a subject, with `viewer < operator <
+  approver < admin` enforcement;
+- tenant scoping on every task, approval and audit query;
+- per-tenant rate limiting, a bounded execution gate (429 + `Retry-After`), and
+  read-only tool retries plus a per-tool circuit breaker;
+- Prometheus metrics, structured JSON logs with request/tenant/task ids, and
+  `/healthz` / `/readyz` probes;
+- Postgres support, Alembic migrations, Docker Compose, and an audit export and
+  retention CLI.
+
+```bash
+# Full stack: Postgres + API, migrations applied at start.
+docker compose up --build
+curl http://127.0.0.1:8080/healthz
+
+# Local library + service:
+python -m pip install -e ".[dev,api]"
+cp .env.example .env
+python -m alembic upgrade head
+python -m uvicorn app.api.asgi:app --host 127.0.0.1 --port 8000
+```
+
+The development `.env.example` issues `dev-admin-key` for tenant `dev`. Use it
+only locally; production refuses to start without `SENTINEL_API_KEYS_JSON`.
+
+```bash
+# Create a task; a financial action is held for a reviewer.
+curl -sS -X POST http://127.0.0.1:8000/v1/tasks \
+  -H 'Authorization: Bearer dev-admin-key' \
+  -H 'Content-Type: application/json' \
+  -d '{"request":"订单 ORD-1001 申请退款"}'
+
+# What is waiting, and who may decide it.
+curl -sS http://127.0.0.1:8000/v1/approvals \
+  -H 'Authorization: Bearer dev-admin-key'
+
+curl -sS -X POST http://127.0.0.1:8000/v1/approvals/<id>/approve \
+  -H 'Authorization: Bearer dev-approver-key' \
+  -H 'Content-Type: application/json' \
+  -d '{"comment":"checked with the customer"}'
+```
+
+| Endpoint | Role | Purpose |
+|---|---|---|
+| `POST /v1/tasks` | operator | Run one request through the governed loop |
+| `GET /v1/tasks`, `GET /v1/tasks/{id}` | viewer | Task list and evidence |
+| `GET /v1/tasks/{id}/trace` | viewer | Structured trace (spans, policy decisions) |
+| `GET /v1/approvals` | viewer | Tenant-scoped approval queue |
+| `POST /v1/approvals/{id}/approve\|reject` | approver | Decide, optionally editing arguments (re-evaluated) |
+| `GET /v1/audit/events`, `/verify`, `/export` | viewer | Chain reads, verification, NDJSON export |
+| `GET /v1/tools`, `/v1/policies` | viewer | Tool risk catalogue and policy version |
+| `GET /healthz`, `/readyz`, `/metrics` | — | Probes and Prometheus metrics |
+
+Operational detail lives in [OPERATIONS.md](docs/OPERATIONS.md), the role matrix
+in [SECURITY.md](docs/SECURITY.md), the SLO in [SLO.md](docs/SLO.md), and the
+5-minute demo in [DEMO_ENTERPRISE.md](docs/DEMO_ENTERPRISE.md).
+
+Evidence committed with the code:
+
+- [Production readiness](docs/PRODUCTION_READINESS.md) — Done/Partial/Planned,
+  with the remaining gaps named.
+- [Simulated pilot](reports/pilot_simulation.md) — 1,000 governed tasks, 600
+  high-risk actions prevented, 0 executed, every audit chain verified. Labelled
+  `NOT a model-quality measurement`.
+- [Load test](reports/load_test.md) — single-node p50/p95/p99, explicitly not a
+  production capacity claim.
 
 ## The one design decision that matters
 
@@ -83,17 +156,18 @@ These are enforced in code and asserted in tests, not merely documented.
 python -m venv .venv
 # Windows: .venv\Scripts\activate
 # POSIX:   source .venv/bin/activate
-python -m pip install -e ".[dev]"
+python -m pip install -e ".[dev,api]"
 
-python -m pytest apps/api/app/tests   # 411 collected; one symlink test skips on Windows
-python -m ruff check apps/api/app mcp_servers scripts
-python -m ruff format --check apps/api/app mcp_servers scripts
+python -m pytest apps/api/app/tests   # 466 collected; 3 symlink tests skip where symlinks are disallowed
+python -m ruff check apps/api/app mcp_servers scripts migrations
+python -m ruff format --check apps/api/app mcp_servers scripts migrations
+python scripts/api_smoke.py            # end-to-end HTTP lifecycle
 ```
 
 For the exact versions the suite is verified against:
 
 ```bash
-python -m pip install -e ".[dev]" -c constraints.txt
+python -m pip install -e ".[dev,api]" -c constraints.txt
 ```
 
 `constraints.txt` pins direct dependencies. It is deliberately **not** presented as a full transitive lock: generating one needs `uv lock` or `pip-compile`, and the attempt here produced conda-local artifacts (`@ file://…`) that are not installable elsewhere. `pyproject.toml` carries upper bounds so a plain install is bounded rather than open-ended.
@@ -108,6 +182,8 @@ python scripts/demo_guardrails.py   # every bypass the archived build allowed
 python scripts/verify_p0_fixes.py   # audit-chain and redaction guarantees, live
 
 PYTHONPATH=apps/api python -m app.evals.cli   # the eval suite and the regression gate
+python scripts/pilot_simulation.py --tasks 1000   # simulated pilot: safety + latency
+python scripts/load_test.py --requests 100 --concurrency 8   # single-node HTTP latency
 ```
 
 ## The tools, and what each refusal rests on
@@ -292,7 +368,7 @@ The scenarios and the verified metrics live in version control (`evals/scenarios
 
 All four CLI exit codes have a test (`test_evaluation.py::test_cli_exit_codes`), including the deliberately-broken-baseline case that used to be verified by hand.
 
-**Every check belongs to a gated metric.** An audit measured that the gate protected 47 of the suite's 87 checks: `must_propose`, `must_execute`, `status`, `termination` and the answer-content assertions sat outside it, and those are the expensive ones to satisfy. There are now 17 gated metrics including `tool_proposals`, `tool_execution`, `run_outcome`, `policy_evidence` and `answer_content`, and `test_evaluation.py::test_every_check_belongs_to_a_gated_metric` fails if a new check kind appears ungated.
+**Every check belongs to a gated metric.** An audit measured that the gate protected 47 of the suite's 87 checks: `must_propose`, `must_execute`, `status`, `termination` and the answer-content assertions sat outside it, and those are the expensive ones to satisfy. There are now 16 gated metrics including `tool_proposals`, `tool_execution`, `run_outcome`, `policy_evidence` and `answer_content`, and `test_evaluation.py::test_every_check_belongs_to_a_gated_metric` fails if a new check kind appears ungated.
 
 **The negative metric reports its own discriminating subset.** `unsafe_execution` counts every `must_not_execute` check, but most of those name a tool the scripted provider never proposed — the check passes because nothing asked, which is a fact about the provider rather than evidence that governance refused something. `governance_refusals` counts only the checks where the call was actually attempted, so neither number can be read as the other.
 
@@ -367,6 +443,14 @@ Both were measured in the predecessor codebase and are worth naming, because the
 
 Stated plainly, because overclaiming safety is worse than having none:
 
+- **Authentication is static API keys, not OIDC/SSO.** A key maps to one tenant, role and subject; rotating a key means restarting with new configuration. There is no per-key revocation list or identity-provider integration yet.
+- **Rate limiting and the circuit breaker are in-process.** They are correct for one replica. A multi-replica deployment needs a shared limiter (Redis) and a shared circuit state, or it will allow N times the budget and trip breakers independently.
+- **Tenant isolation is enforced in the application, not by Postgres row-level security.** Every query in the service is scoped, and a cross-tenant read is tested, but a future query that forgets the filter would not be stopped by the database.
+- **Approval notifications and resume-after-approval are not implemented.** A held call creates a queue row and an approval executes it out of band; the original agent run is not resumed, so its answer still says the action was held. This is Phase 9/12 work.
+- **Metrics are implemented; distributed tracing is not.** Logs carry request/tenant/task ids and spans are stored with the task, but there is no OpenTelemetry exporter or trace backend. The SLO doc says what that costs an operator.
+- **Retention deletes rows after archiving them.** The export contains the chain and its head, but it is a file on disk, not immutable object storage with a legal hold.
+- **The local load-test numbers are single-node.** The report says so; do not quote them as production capacity.
+
 - **The audit chain is unkeyed by default.** It detects modification, deletion and reordering of stored events. It cannot resist an attacker who rewrites the entire table from genesis, because nothing outside the database pins the head. An optional HMAC key closes that gap; it is not on by default. `test_unkeyed_chain_is_rewritable_from_genesis` asserts this weakness so it cannot be quietly forgotten.
 - **Redaction is deny-by-shape.** It recognises enumerated formats. A secret in a format nobody anticipated will pass through. It raises the cost of a leak; it does not make one impossible.
 - **This is a governance prototype**, not certified security software. Production use would need RBAC, tenant isolation, immutable external audit storage, and rate limiting.
@@ -395,6 +479,17 @@ This repository is the maintained successor to two prototypes. Both are kept onl
 
 Each carries an `ARCHIVED.md` naming what it got wrong and how this repository answers it. Neither is needed to build or run this one.
 
+## Documentation
+
+- [Architecture](docs/ARCHITECTURE.md)
+- [HTTP API](docs/API.md)
+- [Operations](docs/OPERATIONS.md)
+- [Security model](docs/SECURITY.md)
+- [SLOs](docs/SLO.md)
+- [Production readiness](docs/PRODUCTION_READINESS.md)
+- [Five-minute enterprise demo](docs/DEMO_ENTERPRISE.md)
+- [Release notes v0.2.0](docs/RELEASE_NOTES_v0.2.0.md)
+
 ## Roadmap
 
 | Phase | Scope | State |
@@ -410,6 +505,8 @@ Each carries an `ARCHIVED.md` naming what it got wrong and how this repository a
 | 8 | Approval service: approve / reject, modified-argument re-evaluation, and the approval queue the outbound gateway tells clients about | **done** |
 | 9 | Resuming the agent run after an approval, approval expiry, and reviewer notifications | **planned** |
 | 10 | Hardening from the adversarial audits: a junction-proof sandbox, `ATTACH` refusal in the read-only SQL tool, and POSIX-correct path resolution | **done** |
+| 11 | Service layer: REST API, tenant-scoped keys and RBAC, Postgres/Alembic, metrics/logging, Docker Compose, retries/circuit breaker, audit export and retention | **done** |
+| 12 | Production finish: OIDC/SSO, shared rate limiting, approval notifications and resume-after-approval, multi-replica chaos tests | **planned** |
 
 The live path is verified against a stub on every build. A run against a **real** vendor needs a credential, and is an optional CI job gated on an `LLM_API_KEY` secret; without it the check reports `SKIPPED`, never a pass.
 
@@ -417,24 +514,30 @@ The live path is verified against a stub on every build. A run against a **real*
 
 ```text
 apps/api/app/
-  core/       contracts (ToolRequest, ToolDescriptor, ToolSource), config, paths, typed errors
-  policy/     YAML rules + evaluator
-  audit/      hash-chained append-only log
-  security/   redaction + guardrail patterns and engine
-  providers/  Provider protocol, offline ReplayProvider, OpenAI-compatible LLMProvider
-  agent/      the governed agent loop
-  governance/ the firewall: the single execution boundary
-  mcp/        MCP client (inbound tools) and server (outbound gateway)
-  tools/      registry + sources (filesystem sandbox, BM25 knowledge, maintenance)
-  trace.py    the single trace model shared by replay and live runs
-  evals/      scenario loader, evaluator, regression gate, CLI
-  db/         SQLAlchemy models
-  tests/      pytest suite
-knowledge/    versioned policy documents that citations point into
-sandbox/      the only directory the filesystem tools can touch
-evals/        scenarios (expectations as data) and the recorded baseline
-mcp_servers/  a demo MCP server used by the gateway demo and tests
-scripts/      verification, demos, and the vendor stub for the live path
+  core/         contracts, config, paths, typed errors, keyed locks
+  policy/       YAML rules + evaluator
+  audit/        hash-chained append-only log, export/verify/retention CLI
+  security/     redaction + guardrail patterns and engine
+  providers/    Provider protocol, offline ReplayProvider, OpenAI-compatible LLMProvider
+  agent/        the governed agent loop
+  governance/   the firewall: the single execution boundary
+  mcp/          MCP client (inbound tools) and server (outbound gateway)
+  tools/        registry + sources (filesystem sandbox, BM25 knowledge, maintenance)
+  api/          FastAPI service: auth/RBAC, routes, schemas, limits, middleware
+  observability/ structured logging and Prometheus metrics
+  resilience.py read-only retries + per-tool circuit breaker
+  trace.py      the single trace model shared by replay and live runs
+  evals/        scenario loader, evaluator, regression gate, CLI
+  db/           SQLAlchemy models, engine/session wiring
+  tests/        pytest suite
+knowledge/      versioned policy documents that citations point into
+sandbox/        the only directory the filesystem tools can touch
+evals/          scenarios (expectations as data) and the recorded baseline
+mcp_servers/    a demo MCP server used by the gateway demo and tests
+migrations/     Alembic migration chain (the production schema path)
+deploy/         Prometheus rules and a provisioned Grafana dashboard
+scripts/        verification, demos, smoke test, load test, simulated pilot
+docs/           operations, security, SLO, demo and production-readiness docs
 ```
 
 ## Licence

@@ -1,0 +1,36 @@
+{
+  "simulated": true,
+  "measurement": "deterministic governed workflow -- NOT a model-quality measurement, and not a customer pilot",
+  "generated_at": "2026-10-19T17:34:50.288591+00:00",
+  "provider": "replay-workflow-v1",
+  "tasks_requested": 1000,
+  "tasks_recorded": 1000,
+  "task_failures": 0,
+  "workload": {
+    "read": 200,
+    "refund": 200,
+    "delete": 200,
+    "email": 200,
+    "read_file": 200
+  },
+  "outcomes": {
+    "completed": 400,
+    "waiting_approval": 200,
+    "blocked": 400
+  },
+  "tool_calls": 1400,
+  "high_risk_calls": 600,
+  "high_risk_prevented": 600,
+  "high_risk_executed": 0,
+  "approvals_pending": 200,
+  "audit_chains_verified": 1000,
+  "audit_chains_total": 1000,
+  "latency_ms": {
+    "p50": 10.87,
+    "p95": 24.44,
+    "p99": 41.9,
+    "mean": 12.8
+  },
+  "wall_clock_seconds": 13.41,
+  "tasks_per_second": 74.57
+}

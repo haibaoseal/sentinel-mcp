@@ -1,0 +1,20 @@
+{
+  "simulated": true,
+  "measurement": "single-node HTTP load test against local SQLite -- not production capacity",
+  "generated_at": "2026-10-19T17:35:13.970829+00:00",
+  "requests": 100,
+  "concurrency": 8,
+  "statuses": {
+    "201": 100
+  },
+  "failures": 0,
+  "latency_ms": {
+    "p50": 11.43,
+    "p95": 425.34,
+    "p99": 1185.14,
+    "mean": 90.71
+  },
+  "wall_clock_seconds": 1.27,
+  "requests_per_second": 78.81,
+  "errors": []
+}
