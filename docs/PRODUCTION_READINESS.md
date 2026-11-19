@@ -21,15 +21,15 @@ Last reviewed: 2026-10-20 · release `0.2.0`
 | Durable audit | **Done** | Hash chain ordered by explicit `seq`; tamper/deletion tests; NDJSON export with chain head and verdict | Tail truncation and full-genesis rewrite need an external anchor; HMAC key is optional |
 | Retention | **Partial** | `python -m app.audit.cli prune` archives then deletes with a manifest; dry run is default | No immutable object storage / legal hold; no scheduled job shipped |
 | Observability — logs | **Done** | JSON logs with `request_id`, `tenant_id`, `task_id`, route, status, duration | No log shipping configuration (Loki/CloudWatch) |
-| Observability — metrics | **Done** | `/metrics` with HTTP, task, approval, audit, circuit-breaker, DB gauges; Prometheus config and alerts | No tracing (OpenTelemetry) |
+| Observability — metrics | **Done** | `/metrics` with HTTP, task, policy-decision, approval, audit, circuit-breaker, DB gauges; Prometheus config and alerts | No tracing (OpenTelemetry) |
 | Observability — dashboards | **Done** | Provisioned Grafana dashboard and datasource in `deploy/grafana` | Dashboard is provisioned for the compose profile only |
 | Health | **Done** | `/healthz` (liveness) and `/readyz` (DB + tools + policy; 503 when not ready) | — |
 | Overload | **Partial** | Per-tenant token bucket; bounded task gate returns 429 + `Retry-After`; tested | In-process only; multi-replica needs Redis/queue |
 | Dependency failure | **Partial** | Read-only retries with audit trail; per-tool circuit breaker; MCP server failure isolation | Breaker state is per process; no shared state across replicas |
-| Concurrency | **Partial** | Per-task transaction-scoped lock + Postgres row lock; 10-thread audit test asserts a gap-free chain | SQLite remains single-writer; very high write concurrency needs Postgres |
-| Security controls | **Done** | Policy fail-closed, sandbox, read-only SQL, HTTP allow-list, redaction, guardrails, secret-free logs | No external penetration test; no RBAC admin UI |
-| Compliance export | **Partial** | NDJSON audit export with chain verdict and head; retention manifest | No CEF/SIEM connector; no field-level encryption |
-| Testing | **Done** | 466 passed, 3 skipped (symlink-disallowed environment); lint + format; eval gate 19/19 | No multi-replica chaos suite |
+| Concurrency | **Partial** | Per-task and per-approval transaction-scoped locks + Postgres `FOR UPDATE` row locks; 10-thread audit test and 6-thread double-approval race test pass | SQLite remains single-writer; very high write concurrency needs Postgres |
+| Security controls | **Done** | Policy fail-closed, sandbox, read-only SQL, streaming HTTP cap + allow-list, redaction, input + indirect tool-output guardrails, optional SoD, secret-free logs | No external penetration test; no RBAC admin UI |
+| Compliance export | **Partial** | Snapshot-consistent NDJSON audit export with chain verdict and head; retention manifest | No CEF/SIEM connector; no field-level encryption |
+| Testing | **Done** | 483 passed, 3 skipped (symlink-disallowed environment); lint + format; eval gate 19/19; Phase 9 resume-after-approval tested end to end | No multi-replica chaos suite |
 | CI | **Partial** | Lint, tests, eval gate, live-path stub, demos, API smoke, and a Postgres service job that runs migrations + HTTP lifecycle | Image build/publish and multi-replica chaos are not in CI yet |
 | Documentation | **Done** | README, OPERATIONS, SECURITY, SLO, API, ARCHITECTURE, DEMO | No ADR index yet |
 | Business evidence | **Partial** | 1,000-task simulated pilot with safety/latency metrics; report labels itself simulated | No customer pilot, no ROI measured against a baseline |
@@ -43,7 +43,7 @@ pilot are the named gaps.
 
 ```bash
 python -m pip install -e ".[dev,api]"
-python -m pytest apps/api/app/tests -q            # 466 passed, 3 skipped
+python -m pytest apps/api/app/tests -q            # 483 passed, 3 skipped
 python -m app.evals.cli                           # 19/19, 16 gated metrics
 python scripts/api_smoke.py                       # end-to-end HTTP lifecycle
 python scripts/pilot_simulation.py --tasks 1000  # simulated pilot report
