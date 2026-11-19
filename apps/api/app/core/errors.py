@@ -24,6 +24,17 @@ class SentinelError(Exception):
         return {"error": {"code": self.code, "message": self.message, "detail": self.detail}}
 
 
+class ConfigurationError(SentinelError):
+    """The process cannot start with the configuration it was given.
+
+    This is separate from a bad request: it happens at startup, and the message is
+    written for the operator who has to fix the environment.
+    """
+
+    code = "CONFIGURATION_ERROR"
+    http_status = 500
+
+
 class ToolNotFoundError(SentinelError):
     code = "TOOL_NOT_FOUND"
     http_status = 404
@@ -32,6 +43,13 @@ class ToolNotFoundError(SentinelError):
 class ToolExecutionError(SentinelError):
     code = "TOOL_EXECUTION_FAILED"
     http_status = 502
+
+
+class CircuitOpenError(ToolExecutionError):
+    """The dependency is known to be failing; fail fast instead of queueing."""
+
+    code = "CIRCUIT_OPEN"
+    http_status = 503
 
 
 class ToolArgumentError(SentinelError):

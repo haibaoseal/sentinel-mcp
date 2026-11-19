@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sentinel-mcp"
-version = "0.1.0"
+version = "0.2.0"
 description = "A governed Model Context Protocol gateway: policy, human approval, hash-chained audit and evaluation for tool-calling agents."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -13,11 +13,9 @@ requires-python = ">=3.11"
 # the eval report cannot be reproduced by a reviewer, which is the single claim
 # this project most needs to be able to defend.
 #
-# `fastapi`, `uvicorn`, `alembic` and the `openai` extra were inherited from the
-# predecessor and no module imports any of them: this is a library plus CLIs, the
-# outbound gateway is an MCP server rather than a web app, and the schema is created
-# by `Base.metadata.create_all` rather than by a migration. A dependency that
-# nothing imports is a claim about the code that the code does not make.
+# The core dependency set stays a library + CLIs. The HTTP service, metrics and
+# migrations are an optional `api` extra so a reviewer can still install and test
+# the governance core with no web stack; Postgres is a separate `postgres` extra.
 dependencies = [
   "pydantic>=2.7,<3.0",
   "pydantic-settings>=2.3,<3.0",
@@ -28,10 +26,25 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# The service layer is optional so that the governance library still installs
+# without a web stack. `pip install -e ".[api]"` is the supported service install.
+api = [
+  "fastapi>=0.115,<1.0",
+  "uvicorn[standard]>=0.30,<1.0",
+  "prometheus-client>=0.20,<1.0",
+  "alembic>=1.13,<2.0",
+]
+postgres = [
+  "psycopg[binary]>=3.1,<4.0",
+]
 dev = [
   "pytest>=8.2,<10.0",
   "ruff>=0.5,<1.0",
+  "httpx>=0.27,<1.0",
 ]
+
+[project.scripts]
+sentinel-api = "app.api.main:run"
 
 [tool.setuptools.packages.find]
 where = ["apps/api"]

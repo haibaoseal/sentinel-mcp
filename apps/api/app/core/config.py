@@ -40,10 +40,43 @@ class Settings(BaseSettings):
 
     app_name: str = "sentinel-mcp"
     app_env: str = "development"
-    version: str = "0.1.0"
+    version: str = "0.2.0"
     log_level: str = "info"
 
     database_url: str = "sqlite:///./sentinel_mcp.db"
+    # Development convenience: create tables from the models on startup. In a
+    # real deployment this is False and `alembic upgrade head` is the only way
+    # the schema changes. Docker sets it to False.
+    auto_create_schema: bool = True
+
+    # --- HTTP service ------------------------------------------------------
+    # JSON list of {"key", "tenant", "role", "subject"}. Empty is allowed only
+    # outside production, where a single labelled development key is issued so a
+    # fresh checkout can be explored; production refuses to start without keys.
+    # JSON list of {"key", "tenant", "role", "subject"}. The `SENTINEL_` prefix is
+    # the documented deployment name; the unprefixed field is kept for tests and
+    # for callers that construct Settings directly.
+    sentinel_api_keys_json: str = ""
+    api_keys_json: str = ""
+    # Per-tenant request budget per minute. In-process; a multi-replica
+    # deployment needs a shared limiter (Redis) and the OPERATIONS doc says so.
+    rate_limit_per_minute: int = 120
+    max_concurrent_tasks: int = 8
+    # Optional bearer token required by /metrics. Prometheus usually scrapes
+    # over a private network; this is for deployments that cannot.
+    metrics_token: str = ""
+    log_json: bool = True
+
+    # Optional separation-of-duties guard: when True, the principal who created
+    # a task cannot approve its own high-risk tool call.
+    enforce_separation_of_duties: bool = False
+
+    # --- tool resilience ---------------------------------------------------
+    enable_tool_retries: bool = True
+    tool_retry_attempts: int = 2
+    tool_retry_base_delay: float = 0.05
+    circuit_failure_threshold: int = 3
+    circuit_recovery_seconds: float = 15.0
 
     # --- agent provider ----------------------------------------------------
     # "replay" is deterministic and offline. "llm" uses an OpenAI-compatible
@@ -85,12 +118,23 @@ class Settings(BaseSettings):
 
     mcp_stdio_servers: str = ""
     mcp_http_servers: str = ""
+    # Off by default: starting a third-party server is an explicit deployment
+    # decision, not something a service should do because a config string exists.
+    enable_mcp_servers: bool = False
 
     cors_origins: list[str] = Field(
         default_factory=lambda: ["http://localhost:3000", "http://127.0.0.1:3000"]
     )
 
     # -- helpers ------------------------------------------------------------
+
+    @property
+    def is_production(self) -> bool:
+        return self.app_env.strip().lower() in {"production", "prod"}
+
+    @property
+    def effective_api_keys_json(self) -> str:
+        return self.sentinel_api_keys_json.strip() or self.api_keys_json.strip()
 
     @property
     def sandbox_path(self) -> Path:

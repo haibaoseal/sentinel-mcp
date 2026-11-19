@@ -28,14 +28,17 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+from contextlib import ExitStack
 from dataclasses import dataclass
 from typing import Any
 
+from sqlalchemy import event as sa_event
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from app.core.locks import TASK_LOCKS
 from app.core.security import new_id, utcnow
-from app.db.models import AuditEvent
+from app.db.models import AgentTask, AuditEvent
 
 GENESIS_HASH = "GENESIS"
 
@@ -139,6 +142,48 @@ class AuditLogger:
         ).first()
         return prior.event_hash if prior else GENESIS_HASH
 
+    def _lock_transaction(self, key: str) -> None:
+        """Hold the per-task lock until this transaction ends.
+
+        Holding it only around one INSERT is not enough on SQLite or Postgres:
+        the transaction keeps its write lock (or row lock) until commit, so a
+        second writer that grabbed the process lock after the first INSERT would
+        block on the database while the first writer waited for the process lock
+        again. That is a deadlock, and it is why the lock is released by the
+        session's commit/rollback hooks rather than by this method.
+        """
+        info = self.session.info
+        locks: dict[str, ExitStack] = info.setdefault("sentinel_audit_locks", {})
+        if key in locks:
+            return
+        stack = ExitStack()
+        stack.enter_context(TASK_LOCKS.hold(key))
+        locks[key] = stack
+        if info.get("sentinel_audit_lock_hooks"):
+            return
+
+        def release(session: Session, transaction) -> None:
+            # Nested transactions end too; only the outermost end means the
+            # caller's unit of work is over and the lock may be handed on.
+            if transaction.parent is not None:
+                return
+            held: dict[str, ExitStack] = session.info.pop("sentinel_audit_locks", {})
+            for held_stack in held.values():
+                held_stack.close()
+
+        # Installed once per Session lifetime so repeated transactions on the
+        # same session reuse the single listener instead of leaking callbacks.
+        info["sentinel_audit_lock_hooks"] = True
+        sa_event.listen(self.session, "after_transaction_end", release)
+
+    def _release_locks_if_idle(self) -> None:
+        """Release after a failure that never opened a transaction."""
+        if self.session.get_transaction() is not None:
+            return
+        held: dict[str, ExitStack] = self.session.info.pop("sentinel_audit_locks", {})
+        for held_stack in held.values():
+            held_stack.close()
+
     def write(
         self,
         *,
@@ -153,33 +198,47 @@ class AuditLogger:
         from app.security.secrets import sanitize_payload
 
         sanitized = sanitize_payload(payload)
-        seq = self.next_seq(task_id)
-        prev_hash = self.previous_hash(task_id, seq)
-        event_id = new_id()
-        envelope = event_hash_payload(
-            event_id=event_id,
-            task_id=task_id,
-            seq=seq,
-            event_type=event_type,
-            actor_type=actor_type,
-            actor_id=actor_id,
-            payload=sanitized,
-        )
-        record = AuditEvent(
-            id=event_id,
-            task_id=task_id,
-            seq=seq,
-            event_type=event_type,
-            actor_type=actor_type,
-            actor_id=actor_id,
-            payload_json=sanitized,
-            prev_hash=prev_hash,
-            event_hash=compute_event_hash(prev_hash, envelope, key=self.hmac_key),
-            created_at=utcnow(),
-        )
-        self.session.add(record)
-        self.session.flush()
-        return record
+        self._lock_transaction(task_id or "__global__")
+        try:
+            # Postgres has no process-wide lock shared by replicas, so take a row
+            # lock on the task for the rest of this transaction. SQLite serialises
+            # writers at the database level and ignores FOR UPDATE; the process lock
+            # above covers the single-process API deployment.
+            if task_id is not None and self.session.get_bind().dialect.name == "postgresql":
+                self.session.execute(
+                    select(AgentTask.id).where(AgentTask.id == task_id).with_for_update()
+                ).first()
+
+            seq = self.next_seq(task_id)
+            prev_hash = self.previous_hash(task_id, seq)
+            event_id = new_id()
+            envelope = event_hash_payload(
+                event_id=event_id,
+                task_id=task_id,
+                seq=seq,
+                event_type=event_type,
+                actor_type=actor_type,
+                actor_id=actor_id,
+                payload=sanitized,
+            )
+            record = AuditEvent(
+                id=event_id,
+                task_id=task_id,
+                seq=seq,
+                event_type=event_type,
+                actor_type=actor_type,
+                actor_id=actor_id,
+                payload_json=sanitized,
+                prev_hash=prev_hash,
+                event_hash=compute_event_hash(prev_hash, envelope, key=self.hmac_key),
+                created_at=utcnow(),
+            )
+            self.session.add(record)
+            self.session.flush()
+            return record
+        except Exception:
+            self._release_locks_if_idle()
+            raise
 
 
 def read_chain(session: Session, task_id: str) -> list[AuditEvent]:

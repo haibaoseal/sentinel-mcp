@@ -38,16 +38,26 @@ class AgentTask(Base):
     __tablename__ = "agent_tasks"
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True, default=_uuid)
+    # Every task belongs to exactly one tenant. Existing single-tenant callers
+    # get "default"; the HTTP API always sets it from the authenticated key, so a
+    # request can never choose its own tenant.
+    tenant_id: Mapped[str] = mapped_column(String(64), default="default", index=True)
     user_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     title: Mapped[str] = mapped_column(String(255), default="Untitled task")
     user_request: Mapped[str] = mapped_column(Text, default="")
     agent_type: Mapped[str] = mapped_column(String(64), default="llm")
-    # pending | running | waiting_approval | completed | failed | blocked | unsupported
+    # pending | running | waiting_approval | completed | failed | blocked | rejected | unsupported
     status: Mapped[str] = mapped_column(String(32), default="pending")
     # Which provider produced the plan. Recorded so a report can never confuse a
     # deterministic replay with a live model run.
     provider: Mapped[str | None] = mapped_column(String(64), nullable=True)
     model: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    answer: Mapped[str | None] = mapped_column(Text, nullable=True)
+    termination: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # The structured trace the run produced. Stored with the task so the HTTP
+    # API can return evidence after the process that ran it is gone.
+    trace_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
@@ -111,6 +121,10 @@ class ApprovalRequest(Base):
     __tablename__ = "approval_requests"
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True, default=_uuid)
+    # Denormalised from the task so the approval queue can be scoped to a tenant
+    # without a join on every poll. It is set by the firewall from the task, never
+    # by a client, and `task_id` remains the source of truth.
+    tenant_id: Mapped[str] = mapped_column(String(64), default="default", index=True)
     tool_call_id: Mapped[str] = mapped_column(ForeignKey("tool_calls.id"), index=True)
     task_id: Mapped[str | None] = mapped_column(
         ForeignKey("agent_tasks.id"), nullable=True, index=True
