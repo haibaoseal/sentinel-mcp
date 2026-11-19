@@ -302,12 +302,12 @@ class MCPClient:
         if self.spec.use_system_proxy:
             return create_mcp_http_client(headers=dict(self.spec.headers) or None)
 
-        import httpx2
+        import httpx
 
-        return httpx2.AsyncClient(
+        return httpx.AsyncClient(
             headers=dict(self.spec.headers) or None,
             trust_env=False,
-            timeout=httpx2.Timeout(30.0, read=self.spec.call_timeout),
+            timeout=httpx.Timeout(30.0, read=self.spec.call_timeout),
         )
 
     def close(self) -> None:

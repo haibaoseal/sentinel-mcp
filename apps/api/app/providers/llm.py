@@ -14,7 +14,8 @@ decision meaningful.
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
+import time
+from collections.abc import Callable, Sequence
 from typing import Any
 
 import httpx
@@ -31,6 +32,8 @@ from app.providers.base import (
 DEFAULT_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_TIMEOUT_SECONDS = 60.0
 MAX_ATTEMPTS = 3
+DEFAULT_RETRY_BASE_DELAY = 0.2
+MAX_RETRY_DELAY = 10.0
 
 
 class LLMProvider:
@@ -46,6 +49,8 @@ class LLMProvider:
         temperature: float = 0.0,
         client: httpx.Client | None = None,
         use_system_proxy: bool = False,
+        retry_base_delay: float = DEFAULT_RETRY_BASE_DELAY,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         if not api_key:
             raise ProviderError("LLM provider requires an API key", retryable=False)
@@ -56,6 +61,8 @@ class LLMProvider:
         self._base_url = base_url.rstrip("/")
         self._timeout = timeout
         self._temperature = temperature
+        self._retry_base_delay = max(0.0, retry_base_delay)
+        self._sleep = sleep
         # One client for the lifetime of the provider: the previous version built a
         # fresh client per request, which discards connection pooling and leaks
         # transport resources on a long-lived agent.
@@ -121,7 +128,7 @@ class LLMProvider:
         }
         last_error: Exception | None = None
 
-        for _attempt in range(1, MAX_ATTEMPTS + 1):
+        for attempt in range(1, MAX_ATTEMPTS + 1):
             try:
                 response = self._client.post(url, json=payload, headers=headers)
             except httpx.TimeoutException as exc:
@@ -129,10 +136,12 @@ class LLMProvider:
                     f"LLM request timed out after {self._timeout}s", retryable=True
                 )
                 last_error.__cause__ = exc
+                self._backoff(attempt)
                 continue
             except httpx.HTTPError as exc:
                 last_error = ProviderError(f"LLM transport error: {exc}", retryable=True)
                 last_error.__cause__ = exc
+                self._backoff(attempt)
                 continue
 
             if response.status_code == 429 or response.status_code >= 500:
@@ -140,6 +149,7 @@ class LLMProvider:
                     f"LLM backend returned {response.status_code}: {_safe_body(response)}",
                     retryable=True,
                 )
+                self._backoff(attempt, retry_after=response.headers.get("retry-after"))
                 continue
             if response.status_code >= 400:
                 # 4xx other than 429 will not succeed on retry; fail loudly with
@@ -165,6 +175,20 @@ class LLMProvider:
 
         assert last_error is not None
         raise last_error
+
+    def _backoff(self, attempt: int, *, retry_after: str | None = None) -> None:
+        if attempt >= MAX_ATTEMPTS:
+            return
+        delay = min(MAX_RETRY_DELAY, self._retry_base_delay * (2 ** (attempt - 1)))
+        if retry_after:
+            try:
+                parsed = float(retry_after.strip())
+                if parsed >= 0:
+                    delay = min(MAX_RETRY_DELAY, parsed)
+            except ValueError:
+                pass
+        if delay > 0:
+            self._sleep(delay)
 
 
 def _encode_message(message: ProviderMessage) -> dict[str, Any]:

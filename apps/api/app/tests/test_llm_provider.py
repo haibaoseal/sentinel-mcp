@@ -389,3 +389,28 @@ def test_the_api_key_is_never_echoed_into_an_error():
     # The backend's own text is passed through, so this asserts our layer does not
     # *add* the credential; a vendor echoing it is the vendor's behaviour.
     assert "sk-" not in str(excinfo.value)
+
+
+def test_retry_uses_exponential_backoff_and_honours_retry_after():
+    delays: list[float] = []
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return httpx.Response(429, headers={"Retry-After": "1.5"}, json={"error": "rate"})
+        if calls["n"] == 2:
+            return httpx.Response(503, text="busy")
+        return reply({"content": "ok"})
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    provider = LLMProvider(
+        api_key="test-key",
+        model="test-model",
+        client=client,
+        retry_base_delay=0.25,
+        sleep=delays.append,
+    )
+    decision = provider.decide(messages=MESSAGES, tools=TOOLS)
+    assert decision.final_answer == "ok"
+    assert delays == [1.5, 0.5]

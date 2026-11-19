@@ -1,6 +1,6 @@
 """Assemble a runnable agent from configuration.
 
-One function builds the whole graph so that every entry point -- CLI, HTTP API,
+One function builds the whole graph so that every entry point -- CLI, MCP server,
 evaluation harness -- governs identically. If a caller could assemble its own
 registry and skip the firewall, the boundary would be decorative.
 """
@@ -13,12 +13,13 @@ from pathlib import Path
 from app.agent.loop import AgentLoop
 from app.core.config import Settings, get_settings
 from app.core.contracts import ToolSource
-from app.core.errors import SentinelError
+from app.core.errors import ConfigurationError
 from app.governance.firewall import Firewall
 from app.mcp.client import MCPClient, MCPServerSpec, MCPToolSource
 from app.policy.engine import PolicyEngine, load_policy_document
 from app.providers.base import Provider
 from app.providers.replay import ReplayProvider
+from app.resilience import ToolResilience
 from app.tools.registry import ToolRegistry
 from app.tools.sources.filesystem import FilesystemSandbox, build_filesystem_source
 from app.tools.sources.github import build_github_source
@@ -26,11 +27,6 @@ from app.tools.sources.http import build_http_source
 from app.tools.sources.knowledge import build_knowledge_source
 from app.tools.sources.maintenance import build_maintenance_source
 from app.tools.sources.sql import build_sql_source
-
-
-class ConfigurationError(SentinelError):
-    code = "CONFIGURATION_ERROR"
-    http_status = 500
 
 
 @dataclass
@@ -143,11 +139,22 @@ def build_runtime(
     resolved = settings or get_settings()
     policy = load_policy_document(resolved.policy_path or None)
     registry = build_registry(resolved, sandbox_root=sandbox_root, enable_mcp=enable_mcp)
+    resilience = (
+        ToolResilience(
+            retry_attempts=resolved.tool_retry_attempts,
+            retry_base_delay=resolved.tool_retry_base_delay,
+            circuit_failure_threshold=resolved.circuit_failure_threshold,
+            circuit_recovery_seconds=resolved.circuit_recovery_seconds,
+        )
+        if resolved.enable_tool_retries
+        else None
+    )
     firewall = Firewall(
         registry=registry,
         policy_engine=PolicyEngine(policy),
         runtime_flags=resolved.runtime_flags(),
         hmac_key=resolved.hmac_key_bytes,
+        resilience=resilience,
     )
     provider = build_provider(resolved)
     loop = AgentLoop(provider=provider, firewall=firewall, max_turns=resolved.max_agent_turns)

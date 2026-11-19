@@ -225,9 +225,17 @@ def test_allowlisted_public_host_is_fetched(monkeypatch):
         status_code = 200
         headers = {"content-type": "text/plain"}
         encoding = "utf-8"
-        content = b"hello"
         is_redirect = False
         url = "https://example.com/"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def iter_bytes(self):
+            yield b"hello"
 
     class FakeClient:
         def __init__(self, **kwargs):
@@ -239,7 +247,7 @@ def test_allowlisted_public_host_is_fetched(monkeypatch):
         def __exit__(self, *exc):
             return False
 
-        def get(self, url, headers=None):
+        def stream(self, method, url, headers=None):
             return FakeResponse()
 
     monkeypatch.setattr(httpx, "Client", FakeClient)
@@ -256,9 +264,17 @@ def test_redirect_is_refused_rather_than_followed(monkeypatch):
         status_code = 302
         headers = {"location": "http://169.254.169.254/"}
         encoding = "utf-8"
-        content = b""
         is_redirect = True
         url = "https://example.com/"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def iter_bytes(self):
+            yield b""
 
     class FakeClient:
         def __init__(self, **kwargs):
@@ -270,7 +286,7 @@ def test_redirect_is_refused_rather_than_followed(monkeypatch):
         def __exit__(self, *exc):
             return False
 
-        def get(self, url, headers=None):
+        def stream(self, method, url, headers=None):
             return FakeResponse()
 
     monkeypatch.setattr(httpx, "Client", FakeClient)
@@ -278,17 +294,29 @@ def test_redirect_is_refused_rather_than_followed(monkeypatch):
         source.execute("http_get", {"url": "https://example.com/"})
 
 
-def test_oversized_response_is_refused(monkeypatch):
+def test_oversized_response_is_refused_incrementally(monkeypatch):
     source = build_http_source(["example.com"])
     from app.tools.sources import http as http_module
+
+    chunks_read = {"n": 0}
 
     class FakeResponse:
         status_code = 200
         headers = {"content-type": "application/octet-stream"}
         encoding = None
-        content = b"x" * (http_module.MAX_RESPONSE_BYTES + 1)
         is_redirect = False
         url = "https://example.com/"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def iter_bytes(self):
+            for _ in range(10):
+                chunks_read["n"] += 1
+                yield b"x" * (http_module.MAX_RESPONSE_BYTES // 2 + 1)
 
     class FakeClient:
         def __init__(self, **kwargs):
@@ -300,12 +328,14 @@ def test_oversized_response_is_refused(monkeypatch):
         def __exit__(self, *exc):
             return False
 
-        def get(self, url, headers=None):
+        def stream(self, method, url, headers=None):
             return FakeResponse()
 
     monkeypatch.setattr(httpx, "Client", FakeClient)
-    with pytest.raises(ToolExecutionError, match="above the .* byte limit"):
+    with pytest.raises(ToolExecutionError, match="byte limit"):
         source.execute("http_get", {"url": "https://example.com/"})
+    # Aborted on the second chunk rather than reading all 10 into memory.
+    assert chunks_read["n"] == 2
 
 
 def test_client_does_not_trust_the_environment_proxy(monkeypatch):
@@ -317,9 +347,17 @@ def test_client_does_not_trust_the_environment_proxy(monkeypatch):
         status_code = 200
         headers = {}
         encoding = "utf-8"
-        content = b"ok"
         is_redirect = False
         url = "https://example.com/"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def iter_bytes(self):
+            yield b"ok"
 
     class FakeClient:
         def __init__(self, **kwargs):
@@ -331,7 +369,7 @@ def test_client_does_not_trust_the_environment_proxy(monkeypatch):
         def __exit__(self, *exc):
             return False
 
-        def get(self, url, headers=None):
+        def stream(self, method, url, headers=None):
             return FakeResponse()
 
     monkeypatch.setattr(httpx, "Client", FakeClient)

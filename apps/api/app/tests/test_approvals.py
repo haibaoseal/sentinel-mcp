@@ -395,3 +395,44 @@ def test_a_block_rule_is_not_relaxed_by_an_approval(firewall, session, task, exe
 
     assert result.status == "blocked", "default_block outranks any approval"
     assert executions == []
+
+
+def test_separation_of_duties_refuses_self_approval(firewall, session, task, executions):
+    task.user_id = "alice"
+    session.flush()
+    approval = _hold(firewall, session, task)
+
+    service = ApprovalService(firewall=firewall, session=session, enforce_separation_of_duties=True)
+    with pytest.raises(ApprovalStateError, match="separation-of-duties"):
+        service.approve(approval.id, reviewer_id="alice")
+    assert executions == []
+
+    # A different reviewer can still approve.
+    outcome = service.approve(approval.id, reviewer_id="bob")
+    assert outcome.executed is True
+    assert len(executions) == 1
+
+    events = read_chain(session, task.id)
+    assert any(event.event_type == "approval.self_approval_refused" for event in events)
+    assert verify_chain(events).ok is True
+
+
+def test_expire_stale_marks_old_pending_approvals_expired(firewall, session, task, executions):
+    from datetime import timedelta
+
+    from app.core.security import utcnow
+
+    approval = _hold(firewall, session, task)
+    approval.created_at = utcnow() - timedelta(hours=2)
+    session.flush()
+
+    service = ApprovalService(firewall=firewall, session=session)
+    expired = service.expire_stale(max_age=timedelta(hours=1))
+    assert [item.id for item in expired] == [approval.id]
+    assert approval.status == "expired"
+    assert task.status == "expired"
+    assert executions == []
+
+    events = read_chain(session, task.id)
+    assert any(event.event_type == "approval.expired" for event in events)
+    assert verify_chain(events).ok is True

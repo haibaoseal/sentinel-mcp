@@ -18,9 +18,10 @@ internal one. So this tool:
 4. Follows no redirects at all. A redirect is a second request whose target policy
    never approved; refusing them is simpler than re-validating, and an agent that
    needs another URL can ask for it.
-5. Caps the response size. The body is buffered and then rejected if it exceeds the
-   cap, so a hostile endpoint can still make this process hold the whole payload
-   before the refusal; refusing it incrementally is a known improvement.
+5. Caps the response size incrementally via streaming. ``Content-Length`` is
+   checked up front when present, and the stream is aborted as soon as the
+   accumulated bytes exceed the cap so a hostile endpoint cannot force this
+   process to buffer an unbounded payload in memory.
 
 Only GET. POST and anything else would be an external action, and those are a
 separate policy decision rather than a flag on this tool.
@@ -100,36 +101,61 @@ def build_http_source(allowlist: list[str], *, timeout: float = DEFAULT_TIMEOUT)
         try:
             # follow_redirects=False and trust_env=False: no redirect hop whose target
             # was never approved, and no proxy that could answer on the host's behalf.
-            with httpx.Client(timeout=timeout, follow_redirects=False, trust_env=False) as client:
-                response = client.get(url, headers=headers)
+            with (
+                httpx.Client(timeout=timeout, follow_redirects=False, trust_env=False) as client,
+                client.stream("GET", url, headers=headers) as response,
+            ):
+                if response.is_redirect:
+                    # Its own error type of message: the reason is policy, not transport.
+                    location = response.headers.get("location", "(no location)")
+                    raise ToolExecutionError(
+                        f"refusing to follow a redirect to {location!r}: only URLs on the "
+                        f"allow-list may be fetched, and a redirect target was never approved"
+                    )
+
+                content_length = response.headers.get("content-length")
+                if content_length is not None:
+                    try:
+                        declared = int(content_length)
+                    except ValueError:
+                        declared = -1
+                    if declared > MAX_RESPONSE_BYTES:
+                        raise ToolExecutionError(
+                            f"response declared {declared} bytes, above the "
+                            f"{MAX_RESPONSE_BYTES} byte limit"
+                        )
+
+                chunks: list[bytes] = []
+                total = 0
+                for chunk in response.iter_bytes():
+                    total += len(chunk)
+                    if total > MAX_RESPONSE_BYTES:
+                        raise ToolExecutionError(
+                            f"response exceeded the {MAX_RESPONSE_BYTES} byte limit while streaming"
+                        )
+                    chunks.append(chunk)
+
+                body = b"".join(chunks)
+                final_url = str(response.url)
+                status_code = response.status_code
+                content_type = response.headers.get("content-type", "")
+                encoding = response.encoding or "utf-8"
+        except ToolExecutionError:
+            raise
         except httpx.TimeoutException as exc:
             raise ToolExecutionError(f"request to {host} timed out after {timeout}s") from exc
         except httpx.HTTPError as exc:
             raise ToolExecutionError(f"request to {host} failed: {exc}") from exc
 
-        if response.is_redirect:
-            # Its own error type of message: the reason is policy, not transport.
-            location = response.headers.get("location", "(no location)")
-            raise ToolExecutionError(
-                f"refusing to follow a redirect to {location!r}: only URLs on the "
-                f"allow-list may be fetched, and a redirect target was never approved"
-            )
-
-        body = response.content
-        if len(body) > MAX_RESPONSE_BYTES:
-            raise ToolExecutionError(
-                f"response was {len(body)} bytes, above the {MAX_RESPONSE_BYTES} byte limit"
-            )
-
         try:
-            text = body.decode(response.encoding or "utf-8", errors="replace")
+            text = body.decode(encoding, errors="replace")
         except (LookupError, UnicodeDecodeError):
             text = body.decode("utf-8", errors="replace")
 
         return {
-            "url": str(response.url),
-            "status": response.status_code,
-            "content_type": response.headers.get("content-type", ""),
+            "url": final_url,
+            "status": status_code,
+            "content_type": content_type,
             "bytes": len(body),
             "body": text,
         }

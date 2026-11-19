@@ -440,6 +440,55 @@ def check_input(text: str) -> GuardrailResult:
     )
 
 
+def check_tool_output(tool_name: str, text: str) -> GuardrailResult:
+    """Screen tool-supplied text for indirect prompt injection attempts.
+
+    Advisory (returns ``warn`` rather than ``block``) so legitimate documents
+    that merely *mention* injection phrases are not silently discarded; the loop
+    audits the hit and injects a data-boundary reminder before the next model
+    turn.
+    """
+    if not text or not text.strip():
+        return GuardrailResult(
+            verdict="allow",
+            checks=[{"rule": "tool_output_screened", "tool": tool_name, "passed": True}],
+        )
+
+    screened = normalise_for_matching(text)
+    rules = _compiled()["injection_patterns"]
+    findings: list[Finding] = []
+    for rule in rules:
+        for pattern in rule["patterns"]:
+            match = pattern.search(screened)
+            if match:
+                findings.append(
+                    Finding(
+                        name=f"indirect_{rule['name']}",
+                        severity="medium",
+                        reason=(
+                            f"Tool {tool_name!r} returned text matching injection pattern "
+                            f"{rule['name']!r}."
+                        ),
+                        detail=f"matched {match.group(0)!r}",
+                        matched=match.group(0),
+                    )
+                )
+                break
+
+    return GuardrailResult(
+        verdict="warn" if findings else "allow",
+        findings=findings,
+        checks=[
+            {
+                "rule": "tool_output_screened",
+                "tool": tool_name,
+                "passed": not findings,
+                "rules_applied": len(rules),
+            }
+        ],
+    )
+
+
 def check_sensitive_echo(text: str) -> GuardrailResult:
     """Advisory scan for credentials echoed into an answer.
 

@@ -37,6 +37,7 @@ from sqlalchemy.orm import Session
 
 from app.core.contracts import ToolRequest
 from app.core.errors import MCPToolNotAllowedError
+from app.core.security import utcnow
 from app.db.models import AgentTask
 from app.governance.firewall import Firewall
 
@@ -163,6 +164,15 @@ class GovernedMCPServer:
                 user_id=self.actor_id,
             )
             result = self.firewall.execute(request, session=session)
+            task.status = {
+                "success": "completed",
+                "blocked": "blocked",
+                "waiting_approval": "waiting_approval",
+            }.get(result.status, "failed")
+            if result.error:
+                task.error = result.error
+            if task.status != "waiting_approval":
+                task.completed_at = utcnow()
             session.commit()
 
             return self._render(exposed_name, upstream, result, task_id=task.id)

@@ -17,28 +17,38 @@ from __future__ import annotations
 import argparse
 import sys
 
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
-
 from app.core.config import get_settings
-from app.db.models import Base
+from app.db.session import build_engine, build_session_factory, create_schema
 from app.governance.firewall import Firewall
 from app.policy.engine import PolicyEngine, load_policy_document
+from app.resilience import ToolResilience
 from app.runtime import build_registry
 
 
 def _build(enable_mcp_servers: bool = False):
     settings = get_settings()
-    engine = create_engine(settings.database_url)
-    Base.metadata.create_all(engine)
-    factory = sessionmaker(bind=engine, expire_on_commit=False)
+    engine = build_engine(settings.database_url)
+    if settings.auto_create_schema:
+        create_schema(engine)
+    factory = build_session_factory(engine)
 
     registry = build_registry(settings, enable_mcp=enable_mcp_servers)
+    resilience = (
+        ToolResilience(
+            retry_attempts=settings.tool_retry_attempts,
+            retry_base_delay=settings.tool_retry_base_delay,
+            circuit_failure_threshold=settings.circuit_failure_threshold,
+            circuit_recovery_seconds=settings.circuit_recovery_seconds,
+        )
+        if settings.enable_tool_retries
+        else None
+    )
     firewall = Firewall(
         registry=registry,
         policy_engine=PolicyEngine(load_policy_document(settings.policy_path or None)),
         runtime_flags=settings.runtime_flags(),
         hmac_key=settings.hmac_key_bytes,
+        resilience=resilience,
     )
     return settings, firewall, factory
 

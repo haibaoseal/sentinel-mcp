@@ -725,3 +725,19 @@ def test_two_tools_that_publish_under_one_name_are_refused(session):
 
     with pytest.raises(MCPToolNotAllowedError, match="same name"):
         governed.tool_descriptors()
+
+
+def test_http_client_without_system_proxy_constructs_httpx_async_client():
+    """Regression: `_http_client` previously imported non-existent `httpx2`."""
+    import httpx
+
+    client = MCPClient(
+        MCPServerSpec(
+            name="remote",
+            transport="http",
+            url="http://127.0.0.1:8765/mcp",
+            use_system_proxy=False,
+        )
+    )
+    http_client = client._http_client()
+    assert isinstance(http_client, httpx.AsyncClient)

@@ -287,7 +287,12 @@ def test_external_client_call_is_governed_over_stdio(stdio_gateway, engine):
         assert call.tool_name == "fs_read"
         assert call.status == "executed"
         from app.audit.logger import read_chain, verify_chain
+        from app.db.models import AgentTask
 
+        task = session.get(AgentTask, call.task_id)
+        assert task is not None
+        assert task.status == "completed"
+        assert task.completed_at is not None
         assert verify_chain(read_chain(session, call.task_id)).ok
 
 

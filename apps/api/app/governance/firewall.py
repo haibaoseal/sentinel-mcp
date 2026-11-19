@@ -31,6 +31,8 @@ Compared with the previous generation, three things changed deliberately:
 
 from __future__ import annotations
 
+import threading
+
 from sqlalchemy.orm import Session
 
 from app.audit.logger import AuditLogger, canonical_json
@@ -44,9 +46,15 @@ from app.core.errors import (
     ToolNotFoundError,
 )
 from app.core.security import new_id, utcnow
-from app.db.models import ApprovalRequest, PolicyDecisionRecord, ToolCall
+from app.db.models import AgentTask, ApprovalRequest, PolicyDecisionRecord, ToolCall
 from app.policy.engine import PolicyDecision, PolicyEngine
+from app.resilience import ToolResilience
 from app.tools.registry import ToolRegistry
+
+try:  # Keep the governance core usable without the optional web/metrics extra.
+    from app.observability import metrics as _metrics
+except Exception:  # pragma: no cover - import guard
+    _metrics = None
 
 
 class Firewall:
@@ -57,17 +65,23 @@ class Firewall:
         policy_engine: PolicyEngine | None = None,
         runtime_flags: dict[str, bool] | None = None,
         hmac_key: bytes | None = None,
+        resilience: ToolResilience | None = None,
     ) -> None:
         self.registry = registry
         self.policy_engine = policy_engine or PolicyEngine()
         self.runtime_flags = runtime_flags or {}
         self.hmac_key = hmac_key
+        self.resilience = resilience
         # Decision per tool_call_id, so a caller building a trace can record *why*
         # a call was allowed, blocked or held without re-evaluating the policy.
         # Re-evaluating would be wrong: policy can change between the decision and
         # the trace, and a trace must describe the decision that was actually made.
         self.decisions: dict[str, PolicyDecision] = {}
         self._decision_order: list[str] = []
+        # The API handles requests on several threads. The decision map is read
+        # later by trace building, so the append/prune pair must not interleave
+        # with another request's write.
+        self._decision_lock = threading.Lock()
 
     # -- public API ---------------------------------------------------------
 
@@ -85,14 +99,19 @@ class Firewall:
         relaxed. Omit it and a ``require_approval`` decision stays a hold.
         """
         decision = self.policy_engine.evaluate(request, runtime_flags=self.runtime_flags)
+        if _metrics is not None:
+            _metrics.POLICY_DECISIONS.labels(
+                decision=decision.decision, risk_level=decision.risk_level
+            ).inc()
         descriptor = self.registry.describe(request.tool_name)
         tool_call_id = new_id()
-        self.decisions[tool_call_id] = decision
-        self._decision_order.append(tool_call_id)
-        # Keep the map bounded: a long-lived process should not accumulate one entry
-        # per call forever.
-        while len(self._decision_order) > 1000:
-            self.decisions.pop(self._decision_order.pop(0), None)
+        with self._decision_lock:
+            self.decisions[tool_call_id] = decision
+            self._decision_order.append(tool_call_id)
+            # Keep the map bounded: a long-lived process should not accumulate one
+            # entry per call forever.
+            while len(self._decision_order) > 1000:
+                self.decisions.pop(self._decision_order.pop(0), None)
 
         tool_call = self._persist_proposal(session, request, decision, descriptor, tool_call_id)
         audit = AuditLogger(session, hmac_key=self.hmac_key)
@@ -211,9 +230,37 @@ class Firewall:
         tool_call_id: str,
     ) -> ToolResult:
         executable = decision.transformed_request or request
+        attempts = 1
 
         try:
-            data = self.registry.execute(executable.tool_name, executable.arguments)
+            if self.resilience is None:
+                data = self.registry.execute(executable.tool_name, executable.arguments)
+            else:
+
+                def _call():
+                    return self.registry.execute(executable.tool_name, executable.arguments)
+
+                def _on_retry(attempt: int, exc: Exception) -> None:
+                    audit.write(
+                        task_id=request.task_id,
+                        event_type="tool.retry",
+                        actor_type="tool",
+                        actor_id=executable.tool_name,
+                        payload={
+                            "tool_call_id": tool_call_id,
+                            "tool_name": executable.tool_name,
+                            "attempt": attempt,
+                            "error_code": getattr(exc, "code", "TOOL_EXECUTION_FAILED"),
+                            "error": str(exc),
+                        },
+                    )
+
+                data, attempts = self.resilience.execute(
+                    tool_name=executable.tool_name,
+                    action_type=executable.action_type,
+                    fn=_call,
+                    on_retry=_on_retry,
+                )
         except (SentinelError, ToolExecutionError, ToolNotFoundError) as exc:
             code = getattr(exc, "code", "TOOL_EXECUTION_FAILED")
             tool_call.status = "failed"
@@ -246,6 +293,7 @@ class Firewall:
                 "tool_call_id": tool_call_id,
                 "tool_name": executable.tool_name,
                 "status": "success",
+                "attempts": attempts,
                 "data": data,
             },
         )
@@ -264,7 +312,13 @@ class Firewall:
         tool_call_id: str,
     ) -> ApprovalRequest:
         """Record the hold so a reviewer has something to decide about."""
+        tenant_id = "default"
+        if request.task_id is not None:
+            task = session.get(AgentTask, request.task_id)
+            if task is not None:
+                tenant_id = task.tenant_id
         approval = ApprovalRequest(
+            tenant_id=tenant_id,
             tool_call_id=tool_call_id,
             task_id=request.task_id,
             requested_by_agent=request.requested_by,
