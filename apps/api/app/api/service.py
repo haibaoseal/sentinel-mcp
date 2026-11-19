@@ -59,6 +59,7 @@ def run_task(
         task.termination = traced.result.termination
         task.error = traced.result.error
         task.trace_json = traced.trace.to_dict()
+        task.resume_state_json = traced.result.resume_state
         task.completed_at = utcnow()
         session.flush()
     except Exception as exc:
@@ -86,6 +87,43 @@ def run_task(
         return task
     finally:
         task_id_var.reset(token)
+
+
+def resume_task_after_approval(
+    *,
+    session: Session,
+    runtime: Runtime,
+    task: AgentTask,
+    approval_id: str,
+    approved_result,
+) -> AgentTask:
+    """Continue a paused agent loop once its held tool call has been approved and executed."""
+    if not task.resume_state_json:
+        return task
+    token = task_id_var.set(task.id)
+    started = time.perf_counter()
+    try:
+        traced = runtime.loop.resume_traced(
+            task_id=task.id,
+            user_request=task.user_request,
+            resume_state=task.resume_state_json,
+            approved_result=approved_result,
+            session=session,
+            approval_id=approval_id,
+        )
+        task.status = traced.result.status
+        task.answer = traced.result.answer
+        task.termination = traced.result.termination
+        task.error = traced.result.error
+        task.trace_json = traced.trace.to_dict()
+        task.resume_state_json = traced.result.resume_state
+        task.completed_at = utcnow()
+        session.flush()
+    finally:
+        duration = time.perf_counter() - started
+        metrics.TASK_DURATION.labels(status=task.status).observe(duration)
+        task_id_var.reset(token)
+    return task
 
 
 def get_task(session: Session, task_id: str, tenant_id: str) -> AgentTask:

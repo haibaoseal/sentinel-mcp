@@ -641,3 +641,71 @@ def test_indirect_injection_in_tool_output_is_audited_and_flagged(session, task)
     events = read_chain(session, task.id)
     assert any(event.event_type == "guardrail.indirect_injection_detected" for event in events)
     assert verify_chain(events).ok is True
+
+
+def test_resume_after_approval_continues_loop_and_audits_chain(firewall, session, task):
+    from app.approvals.service import ApprovalService
+    from app.audit.logger import read_chain, verify_chain
+
+    # Turn 1: model proposes draft_refund (held for approval).
+    # Turn 2 (initial run): model closes while held.
+    # Turn 3 (after resume): model sees executed refund result, reads notes.md, then answers.
+    provider = ScriptedProvider(
+        [
+            ProviderDecision(
+                kind="tool_calls",
+                tool_calls=[
+                    ProviderToolCall(
+                        id="call-refund",
+                        tool_name="draft_refund",
+                        arguments={"order_id": "ORD-1001", "reason": "damaged"},
+                    )
+                ],
+            ),
+            ProviderDecision(kind="final_answer", final_answer="等待审批。"),
+            ProviderDecision(
+                kind="tool_calls",
+                tool_calls=[
+                    ProviderToolCall(
+                        id="call-notes",
+                        tool_name="fs_read",
+                        arguments={"path": "notes.md"},
+                    )
+                ],
+            ),
+            ProviderDecision(
+                kind="final_answer",
+                final_answer="退款草案已按审批创建，并已核对 notes.md。",
+            ),
+        ]
+    )
+    loop = make_loop(firewall, provider)
+    first = loop.run_traced(task_id=task.id, user_request="订单 ORD-1001 退款", session=session)
+    assert first.result.status == "waiting_approval"
+    assert first.result.resume_state is not None
+    approval_id = first.result.resume_state["approval_id"]
+    assert approval_id
+
+    outcome = ApprovalService(firewall=firewall, session=session).approve(
+        approval_id, reviewer_id="rita"
+    )
+    assert outcome.executed is True
+    assert outcome.result is not None
+
+    resumed = loop.resume_traced(
+        task_id=task.id,
+        user_request="订单 ORD-1001 退款",
+        resume_state=first.result.resume_state,
+        approved_result=outcome.result,
+        session=session,
+        approval_id=approval_id,
+    )
+    assert resumed.result.status == "completed"
+    assert "notes.md" in resumed.result.answer
+    assert resumed.result.resume_state is None
+
+    events = read_chain(session, task.id)
+    event_types = [event.event_type for event in events]
+    assert "approval.executed" in event_types
+    assert "task.resumed" in event_types
+    assert verify_chain(events).ok is True

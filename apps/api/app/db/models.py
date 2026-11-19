@@ -58,6 +58,9 @@ class AgentTask(Base):
     # The structured trace the run produced. Stored with the task so the HTTP
     # API can return evidence after the process that ran it is gone.
     trace_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # Sanitised conversation checkpoint persisted when a run is held for human
+    # approval, allowing Phase 9 resume-after-approval to continue the loop.
+    resume_state_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 

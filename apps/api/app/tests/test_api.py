@@ -364,3 +364,31 @@ def test_failed_task_persists_failure_and_audit_trail_on_runtime_exception(api_a
         assert len(chain) == 1
         assert chain[0].event_type == "test.before_crash"
         assert verify_chain(chain).ok is True
+
+
+def test_approve_with_resume_continues_agent_loop_end_to_end(client):
+    task = _create_refund(client)
+    assert task["status"] == "waiting_approval"
+    task_id = task["id"]
+
+    approval = client.get("/v1/approvals", headers=APPROVER).json()["items"][0]
+    decision = client.post(
+        f"/v1/approvals/{approval['id']}/approve",
+        json={"comment": "approved and resume", "resume": True},
+        headers=APPROVER,
+    )
+    assert decision.status_code == 200, decision.text
+    body = decision.json()
+    assert body["executed"] is True
+    assert body["resumed"] is True
+    assert body["task_status"] == "completed"
+    assert body["task_answer"] and "依据【" in body["task_answer"]
+
+    updated = client.get(f"/v1/tasks/{task_id}", headers=ADMIN).json()
+    assert updated["status"] == "completed"
+    assert updated["answer"] == body["task_answer"]
+
+    events = client.get(f"/v1/audit/events?task_id={task_id}", headers=ADMIN).json()["items"]
+    assert any(event["event_type"] == "task.resumed" for event in events)
+    verified = client.get(f"/v1/audit/verify?task_id={task_id}", headers=ADMIN).json()
+    assert verified["ok"] is True

@@ -87,6 +87,10 @@ class ApprovalDecision(BaseModel):
 
     comment: str | None = Field(default=None, max_length=2000)
     modified_arguments: dict[str, Any] | None = None
+    resume: bool = Field(
+        default=False,
+        description="When true and approved, resume the paused agent loop with the tool result.",
+    )
 
 
 class ApprovalList(BaseModel):
@@ -102,6 +106,9 @@ class ApprovalResult(BaseModel):
     reason: str | None = None
     policy_decision: str | None = None
     data: dict[str, Any] | None = None
+    resumed: bool = False
+    task_status: str | None = None
+    task_answer: str | None = None
 
 
 class ToolOut(BaseModel):

@@ -26,16 +26,18 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from app.audit.logger import AuditLogger
-from app.core.contracts import ToolRequest
+from app.core.contracts import ToolRequest, ToolResult
 from app.governance.firewall import Firewall
 from app.providers.base import (
     Provider,
     ProviderError,
     ProviderMessage,
+    ProviderToolCall,
     ProviderToolResult,
     ProviderToolSpec,
 )
 from app.security.guardrails import GuardrailResult, check_input, check_output, check_tool_output
+from app.security.secrets import sanitize_payload
 from app.trace import SpanStatus, Trace, TraceBuilder, TraceSpan
 
 SYSTEM_PROMPT = (
@@ -84,6 +86,9 @@ class AgentRunResult:
     # The guardrail verdict for the run, when one was reached. Exposed so a caller
     # can see what was checked and not only what failed.
     guardrail: Any = None
+    # Sanitised checkpoint persisted when a run pauses for human approval,
+    # allowing `AgentLoop.resume_traced` to continue the conversation once decided.
+    resume_state: dict[str, Any] | None = None
 
 
 @dataclass
@@ -199,6 +204,111 @@ class AgentLoop:
             builder=builder,
         )
 
+    def resume_traced(
+        self,
+        *,
+        task_id: str,
+        user_request: str,
+        resume_state: dict[str, Any],
+        approved_result: ToolResult,
+        session: Session,
+        approval_id: str | None = None,
+        scenario_id: str | None = None,
+    ) -> TracedRun:
+        """Resume a held run after a human reviewer approved and executed its tool call.
+
+        Rehydrates the sanitised transcript checkpoint, replaces the placeholder
+        ``HELD FOR HUMAN APPROVAL`` tool message with the real execution result,
+        audits ``task.resumed``, and runs the remaining turns through the exact
+        same governed loop (firewall, guardrails, trace).
+        """
+        builder = TraceBuilder(
+            run_id=task_id,
+            question=user_request,
+            identity=self.provider.identity,
+            scenario_id=scenario_id,
+        )
+        messages = [_decode_message(item) for item in resume_state.get("messages") or []]
+        if not messages:
+            messages = [
+                ProviderMessage(role="system", content=SYSTEM_PROMPT),
+                ProviderMessage(role="user", content=user_request),
+            ]
+        pending_call_id = resume_state.get("pending_tool_call_id")
+        pending_tool_name = str(resume_state.get("pending_tool_name") or "")
+        rendered = _render(approved_result)
+        outcome = ProviderToolResult(
+            tool_call_id=approved_result.tool_call_id,
+            tool_name=pending_tool_name,
+            status=approved_result.status,
+            content=rendered,
+            error=approved_result.error,
+        )
+
+        replaced = False
+        for index in range(len(messages) - 1, -1, -1):
+            msg = messages[index]
+            if msg.role == "tool" and (
+                (pending_call_id and msg.tool_call_id == pending_call_id)
+                or (pending_tool_name and msg.tool_name == pending_tool_name)
+            ):
+                messages[index] = ProviderMessage(
+                    role="tool",
+                    content=_tool_content(outcome),
+                    tool_call_id=msg.tool_call_id,
+                    tool_name=msg.tool_name,
+                )
+                replaced = True
+                break
+        if not replaced:
+            messages.append(
+                ProviderMessage(
+                    role="tool",
+                    content=_tool_content(outcome),
+                    tool_call_id=pending_call_id or approved_result.tool_call_id,
+                    tool_name=pending_tool_name or None,
+                )
+            )
+
+        citations = list(resume_state.get("citations") or [])
+        citations.extend(_citations_from(outcome))
+        seen_calls = {
+            (str(pair[0]), str(pair[1]))
+            for pair in (resume_state.get("seen_calls") or [])
+            if isinstance(pair, (list, tuple)) and len(pair) == 2
+        }
+        turns_used = int(resume_state.get("turns_used") or 0)
+
+        AuditLogger(session, hmac_key=self.firewall.hmac_key).write(
+            task_id=task_id,
+            event_type="task.resumed",
+            actor_type="system",
+            actor_id="agent-loop",
+            payload={
+                "approval_id": approval_id or resume_state.get("approval_id"),
+                "tool_name": pending_tool_name,
+                "tool_call_id": approved_result.tool_call_id,
+                "tool_status": approved_result.status,
+            },
+        )
+        builder.tool_span(
+            tool_name=pending_tool_name or "approved_tool",
+            status=_span_status(approved_result.status),
+            source=approved_result.source,
+            error_code=approved_result.error if approved_result.status == "failed" else None,
+        )
+        return self._run_loop(
+            task_id=task_id,
+            user_request=user_request,
+            session=session,
+            builder=builder,
+            initial_messages=messages,
+            initial_citations=citations,
+            initial_seen_calls=seen_calls,
+            initial_results=[outcome],
+            turns_used=turns_used,
+        )
+
     def _run_loop(
         self,
         *,
@@ -206,19 +316,30 @@ class AgentLoop:
         user_request: str,
         session: Session,
         builder: TraceBuilder,
+        initial_messages: list[ProviderMessage] | None = None,
+        initial_citations: list[dict[str, Any]] | None = None,
+        initial_seen_calls: set[tuple[str, str]] | None = None,
+        initial_results: list[ProviderToolResult] | None = None,
+        turns_used: int = 0,
     ) -> TracedRun:
-        messages: list[ProviderMessage] = [
-            ProviderMessage(role="system", content=SYSTEM_PROMPT),
-            ProviderMessage(role="user", content=user_request),
-        ]
+        messages: list[ProviderMessage] = (
+            list(initial_messages)
+            if initial_messages is not None
+            else [
+                ProviderMessage(role="system", content=SYSTEM_PROMPT),
+                ProviderMessage(role="user", content=user_request),
+            ]
+        )
         specs = self.specs()
         steps: list[LoopStep] = []
-        results: list[ProviderToolResult] = []
-        seen_calls: set[tuple[str, str]] = set()
-        citations: list[dict[str, Any]] = []
+        results: list[ProviderToolResult] = list(initial_results or [])
+        seen_calls: set[tuple[str, str]] = set(initial_seen_calls or ())
+        citations: list[dict[str, Any]] = list(initial_citations or [])
         usage: dict[str, int] | None = None
+        held_call: dict[str, str | None] | None = None
+        remaining_turns = max(1, self.max_turns - turns_used)
 
-        for turn in range(1, self.max_turns + 1):
+        for turn in range(1, remaining_turns + 1):
             try:
                 decision = self.provider.decide(messages=messages, tools=specs)
             except ProviderError as exc:
@@ -304,6 +425,21 @@ class AgentLoop:
                     status = "failed" if status == "completed" else status
                     answer = _guardrail_refusal(output_check, answer)
 
+                resume_state = None
+                if status == "waiting_approval" and held_call is not None:
+                    resume_state = sanitize_payload(
+                        {
+                            "version": 1,
+                            "messages": [_encode_message(msg) for msg in messages],
+                            "citations": citations,
+                            "seen_calls": [list(pair) for pair in sorted(seen_calls)],
+                            "pending_tool_call_id": held_call["call_id"],
+                            "pending_tool_name": held_call["tool_name"],
+                            "approval_id": held_call["approval_id"],
+                            "turns_used": turns_used + turn,
+                        }
+                    )
+
                 result = AgentRunResult(
                     status=status,
                     answer=answer,
@@ -314,6 +450,7 @@ class AgentLoop:
                     ),
                     usage=usage,
                     guardrail=output_check,
+                    resume_state=resume_state,
                 )
                 builder.add(
                     TraceSpan(
@@ -383,8 +520,14 @@ class AgentLoop:
                     )
                 seen_calls.add(signature)
 
-                outcome = self._invoke(call, task_id=task_id, session=session)
+                outcome, approval_id = self._invoke(call, task_id=task_id, session=session)
                 results.append(outcome)
+                if outcome.status == "waiting_approval":
+                    held_call = {
+                        "call_id": call.id,
+                        "tool_name": call.tool_name,
+                        "approval_id": approval_id,
+                    }
                 # Remember any evidence this call retrieved, so the output
                 # guardrail can check the answer against the same chunks the agent
                 # actually saw. Without this the grounding check has nothing to
@@ -484,7 +627,9 @@ class AgentLoop:
 
     # -- helpers ------------------------------------------------------------
 
-    def _invoke(self, call, *, task_id: str, session: Session) -> ProviderToolResult:
+    def _invoke(
+        self, call, *, task_id: str, session: Session
+    ) -> tuple[ProviderToolResult, str | None]:
         """Route one proposed call through governance."""
         descriptor = self.firewall.registry.describe(call.tool_name)
         request = ToolRequest(
@@ -496,12 +641,18 @@ class AgentLoop:
             requested_by="agent",
         )
         result = self.firewall.execute(request, session=session)
-        return ProviderToolResult(
-            tool_call_id=result.tool_call_id,
-            tool_name=call.tool_name,
-            status=result.status,
-            content=_render(result),
-            error=result.error,
+        approval_id = (
+            (result.data or {}).get("approval_id") if result.status == "waiting_approval" else None
+        )
+        return (
+            ProviderToolResult(
+                tool_call_id=result.tool_call_id,
+                tool_name=call.tool_name,
+                status=result.status,
+                content=_render(result),
+                error=result.error,
+            ),
+            approval_id,
         )
 
 
@@ -720,3 +871,40 @@ def _describe_calls(calls) -> str:
     if not calls:
         return ""
     return "Calling: " + ", ".join(f"{call.tool_name}({_stable(call.arguments)})" for call in calls)
+
+
+def _encode_message(message: ProviderMessage) -> dict[str, Any]:
+    return {
+        "role": message.role,
+        "content": message.content,
+        "tool_call_id": message.tool_call_id,
+        "tool_name": message.tool_name,
+        "tool_calls": [
+            {
+                "id": call.id,
+                "tool_name": call.tool_name,
+                "arguments": call.arguments,
+                "rationale": call.rationale,
+            }
+            for call in message.tool_calls
+        ],
+    }
+
+
+def _decode_message(raw: dict[str, Any]) -> ProviderMessage:
+    return ProviderMessage(
+        role=raw.get("role", "user"),
+        content=str(raw.get("content") or ""),
+        tool_call_id=raw.get("tool_call_id"),
+        tool_name=raw.get("tool_name"),
+        tool_calls=[
+            ProviderToolCall(
+                id=str(item.get("id") or ""),
+                tool_name=str(item.get("tool_name") or ""),
+                arguments=dict(item.get("arguments") or {}),
+                rationale=item.get("rationale"),
+            )
+            for item in (raw.get("tool_calls") or [])
+            if isinstance(item, dict)
+        ],
+    )

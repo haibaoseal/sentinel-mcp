@@ -80,7 +80,24 @@ def approve(
         modified_arguments=decision.modified_arguments,
         comment=decision.comment,
     )
-    task_id = service.get_approval(session, approval_id, principal.tenant_id).task_id
+    approval = service.get_approval(session, approval_id, principal.tenant_id)
+    task_id = approval.task_id
+    resumed = False
+    task_status: str | None = None
+    task_answer: str | None = None
+    if decision.resume and outcome.executed and outcome.result is not None and task_id is not None:
+        task = service.get_task(session, task_id, principal.tenant_id)
+        if task.resume_state_json:
+            updated_task = service.resume_task_after_approval(
+                session=session,
+                runtime=runtime,
+                task=task,
+                approval_id=approval_id,
+                approved_result=outcome.result,
+            )
+            resumed = True
+            task_status = updated_task.status
+            task_answer = updated_task.answer
     session.commit()
     metric_label = outcome.status
     if outcome.status == "executed":
@@ -94,6 +111,9 @@ def approve(
         reason=outcome.reason,
         policy_decision=outcome.policy_decision,
         data=outcome.result.data if outcome.result is not None else None,
+        resumed=resumed,
+        task_status=task_status,
+        task_answer=task_answer,
     )
 
 
