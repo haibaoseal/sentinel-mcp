@@ -1,0 +1,93 @@
+name: sentinel-mcp
+
+# One command brings up a production-shaped stack: Postgres, the API with
+# migrations applied at start, and an optional Prometheus + Grafana profile.
+#
+#   docker compose up --build
+#   docker compose --profile observability up --build
+#
+# The API keys below are development fixtures. Replace them before exposing the
+# service anywhere: `openssl rand -hex 32` per key, one tenant per customer.
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: sentinel
+      POSTGRES_USER: sentinel
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-sentinel-dev-password}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sentinel -d sentinel"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  api:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "${API_PORT:-8080}:8000"
+    environment:
+      APP_ENV: production
+      LOG_LEVEL: info
+      LOG_JSON: "true"
+      DATABASE_URL: postgresql+psycopg://sentinel:${POSTGRES_PASSWORD:-sentinel-dev-password}@db:5432/sentinel
+      AUTO_CREATE_SCHEMA: "false"
+      # Development fixtures; replace for any shared deployment.
+      SENTINEL_API_KEYS_JSON: >-
+        [{"key":"dev-admin-key","tenant":"tenant-a","role":"admin","subject":"alice"},
+         {"key":"dev-viewer-key","tenant":"tenant-a","role":"viewer","subject":"bob"},
+         {"key":"dev-approver-key","tenant":"tenant-a","role":"approver","subject":"rita"},
+         {"key":"dev-tenant-b-key","tenant":"tenant-b","role":"admin","subject":"carol"}]
+      AUDIT_HMAC_KEY: ${AUDIT_HMAC_KEY:-dev-only-change-me}
+      RATE_LIMIT_PER_MINUTE: "120"
+      MAX_CONCURRENT_TASKS: "8"
+      ENABLE_TOOL_RETRIES: "true"
+      ENABLE_MCP_SERVERS: "false"
+      TOOL_SANDBOX_ROOT: /app/sandbox
+      KNOWLEDGE_ROOT: /app/knowledge
+      CORS_ORIGINS: '["http://localhost:3000"]'
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    profiles: ["observability"]
+    volumes:
+      - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./deploy/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+    ports:
+      - "9090:9090"
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.3.1
+    profiles: ["observability"]
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/grafana/dashboard.json:/var/lib/grafana/dashboards/sentinel.json:ro
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+volumes:
+  pgdata:

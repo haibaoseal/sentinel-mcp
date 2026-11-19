@@ -1,0 +1,51 @@
+groups:
+  - name: sentinel-mcp
+    rules:
+      - alert: SentinelAuditChainVerificationFailed
+        expr: increase(sentinel_audit_verify_total{result="failed"}[5m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "An audit chain failed verification"
+          description: "A verification request found a broken chain. Treat as a security incident and preserve the database."
+
+      - alert: SentinelApprovalBacklog
+        expr: sentinel_approvals_pending > 20
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Approval backlog is growing"
+          description: "More than 20 high-risk actions have been waiting for a reviewer for 10 minutes."
+
+      - alert: SentinelHighErrorRate
+        expr: |
+          sum(rate(sentinel_http_requests_total{status=~"5.."}[5m]))
+            /
+          clamp_min(sum(rate(sentinel_http_requests_total[5m])), 0.001)
+            > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "5xx rate above 5%"
+          description: "The API is failing more than 5% of requests over five minutes."
+
+      - alert: SentinelDatabaseDown
+        expr: sentinel_db_up == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Database is unreachable"
+          description: "The readiness/metrics path cannot query the database."
+
+      - alert: SentinelCircuitOpen
+        expr: sentinel_circuit_breaker_open == 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "A tool circuit breaker is open"
+          description: "A dependency has failed repeatedly; calls to that tool are failing fast."
